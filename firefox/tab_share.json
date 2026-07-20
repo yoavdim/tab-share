@@ -1,0 +1,9 @@
+{
+  "name": "tab_share",
+  "description": "Tab Share native messaging host",
+  "path": "PLACEHOLDER",
+  "type": "stdio",
+  "allowed_extensions": [
+    "tab-share@local"
+  ]
+}
