@@ -79,3 +79,9 @@ call it (both builds behave the same):
 - The native host is pure Python stdlib — no pip installs.
 - Firefox Multi-Account Containers have no Chromium equivalent; on Chromium `/containers`
   returns an empty list.
+
+## License
+
+Licensed under the [GNU GPL v3](LICENSE) © 2026 Yoav Dim. If you use, modify, or
+redistribute this software, please retain the notice and credit the original author
+([@yoavdim](https://github.com/yoavdim)).
