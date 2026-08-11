@@ -32,6 +32,28 @@ Different ports let both browsers run at the same time. The skills default to Fi
 command -v python3 jq    # both must print a path
 ```
 
+## Quick Start
+
+Run the interactive setup script, which automatically detects your browser and environment (standard vs. Snap):
+
+```bash
+./install.sh
+```
+
+Or target a specific browser:
+```bash
+./install.sh chrome
+./install.sh firefox
+./install.sh both
+```
+
+Or install via one-liner:
+```bash
+curl -sSL https://raw.githubusercontent.com/yoavdim/tab-share/main/install.sh | bash
+```
+
+---
+
 ## Step 0 — Is your browser a snap? (Linux)
 
 This matters a lot. Check:
@@ -210,6 +232,8 @@ appear in the available skills.
 ## What each file is
 
 ```
+install.sh                      interactive setup script (detects Snap, clones repo if needed)
+
 firefox/                        Firefox MV2 build
   manifest.json                 extension manifest (id: tab-share@local)
   background.js                 connects to native host; exposes tabs/groups/open/navigate/extract/eval/group/close

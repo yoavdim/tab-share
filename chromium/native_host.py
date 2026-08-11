@@ -101,8 +101,25 @@ def send_and_wait(msg, timeout=5):
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/tabs":
-            if self._is_null_origin() and _focused_split_pair() == (None, None):
-                self._json_response(200, json.dumps({"error": NO_SPLIT_TABS}))
+            if self._is_null_origin():
+                active_id, partner_id = _focused_split_pair()
+                if active_id is None:
+                    self._json_response(200, json.dumps({"error": NO_SPLIT_TABS}))
+                    return
+                active, tabs = _cached_tabs()
+                if not (active and active.get("url", "").startswith("file://")):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+                if self.headers.get("X-Tab-Url") != active.get("url"):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+                split_tabs = [t for t in tabs if t.get("id") in (active_id, partner_id)]
+                narrowed_data = json.dumps({
+                    "type": "tabs",
+                    "activeTab": active,
+                    "tabs": split_tabs
+                })
+                self._json_response(200, narrowed_data)
                 return
             with lock:
                 data = state["data"]
@@ -183,8 +200,15 @@ class Handler(BaseHTTPRequestHandler):
                 if active_id is None:
                     self._json_response(200, json.dumps({"error": NO_SPLIT_TABS}))
                     return
+                active, tabs = _cached_tabs()
+                if not (active and active.get("url", "").startswith("file://")):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+                if self.headers.get("X-Tab-Url") != active.get("url"):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
                 requested = body.get("tabId")
-                if requested not in (active_id, partner_id) or body.get("newTab"):
+                if requested != partner_id or body.get("newTab"):
                     self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
                     return
             msg = {"type": "navigate", "url": url}
@@ -283,7 +307,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", allowed)
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Tab-Url")
 
     def log_message(self, *_):
         pass

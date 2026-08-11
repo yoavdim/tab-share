@@ -28,6 +28,39 @@ PORT = 8765
 _LOCALHOST_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
 # Endpoints safe enough to also expose to the file:// (Origin: null) split-tab UI.
 FILE_OK_PATHS = frozenset({"/tabs", "/navigate"})
+# Sentinel reasons returned to a null-origin caller instead of real tab data.
+NO_SPLIT_TABS = "NO_SPLIT_TABS"       # no split-view pair exists right now
+NOT_ALLOWED = "NOT_ALLOWED"           # target tab isn't the focused tab or its partner
+
+
+def _cached_tabs():
+    """Parse the last snapshot pushed from the extension. (activeTab, tabs) or
+    (None, []) if nothing has been cached yet."""
+    with lock:
+        raw = state["data"]
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None, []
+    return data.get("activeTab"), (data.get("tabs") or [])
+
+
+def _focused_split_pair():
+    """(active_tab_id, partner_tab_id) for the tab in focus's split-view partner, or
+    (None, None) if there is no active tab, or it isn't part of a valid split pair
+    right now."""
+    active, tabs = _cached_tabs()
+    if not active:
+        return None, None
+    svid = active.get("splitViewId")
+    if svid is None or svid == -1:
+        return None, None
+    active_id = active.get("id")
+    partner = next((t for t in tabs
+                    if t.get("splitViewId") == svid and t.get("id") != active_id), None)
+    if partner is None:
+        return None, None
+    return active_id, partner.get("id")
 
 
 def read_message():
@@ -62,8 +95,32 @@ def send_and_wait(msg, timeout=5):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _is_null_origin(self):
+        """True only for the file:// (`Origin: null`) case this extra narrowing targets."""
+        return self.headers.get("Origin") == "null"
+
     def do_GET(self):
         if self.path == "/tabs":
+            if self._is_null_origin():
+                active_id, partner_id = _focused_split_pair()
+                if active_id is None:
+                    self._json_response(200, json.dumps({"error": NO_SPLIT_TABS}))
+                    return
+                active, tabs = _cached_tabs()
+                if not (active and active.get("url", "").startswith("file://")):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+                if self.headers.get("X-Tab-Url") != active.get("url"):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+                split_tabs = [t for t in tabs if t.get("id") in (active_id, partner_id)]
+                narrowed_data = json.dumps({
+                    "type": "tabs",
+                    "activeTab": active,
+                    "tabs": split_tabs
+                })
+                self._json_response(200, narrowed_data)
+                return
             with lock:
                 data = state["data"]
             self._json_response(200, data)
@@ -137,6 +194,23 @@ class Handler(BaseHTTPRequestHandler):
             if not url:
                 self._json_response(400, json.dumps({"error": "url required"}))
                 return
+            if self._is_null_origin():
+                # file:// pages may only redirect the focused tab's split partner.
+                active_id, partner_id = _focused_split_pair()
+                if active_id is None:
+                    self._json_response(200, json.dumps({"error": NO_SPLIT_TABS}))
+                    return
+                active, tabs = _cached_tabs()
+                if not (active and active.get("url", "").startswith("file://")):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+                if self.headers.get("X-Tab-Url") != active.get("url"):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+                requested = body.get("tabId")
+                if requested != partner_id or body.get("newTab"):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
             msg = {"type": "navigate", "url": url}
             for k in ("tabId", "newTab", "cookieStoreId", "timeoutMs"):
                 if body.get(k) is not None:
@@ -227,7 +301,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", allowed)
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Tab-Url")
 
     def log_message(self, *_):
         pass

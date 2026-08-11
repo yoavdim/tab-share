@@ -5,10 +5,14 @@
   "description": "Share and manage tabs via local HTTP API",
   "permissions": ["tabs", "tabGroups", "nativeMessaging", "scripting", "alarms"],
   "host_permissions": ["<all_urls>"],
+  "icons": {
+    "128": "icon128.png"
+  },
   "background": {
     "service_worker": "background.js"
   },
   "action": {
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": "icon128.png"
   }
 }
