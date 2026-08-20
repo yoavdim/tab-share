@@ -26,8 +26,9 @@ PORT = 8766
 # curl (our agent) sends no Origin header and ignores CORS entirely, so it is
 # unaffected — this only constrains what browser pages of other origins can call.
 #
-# For `Origin: null` specifically, /tabs and /navigate are further narrowed to 
-# just the focused tab and its split-view partner, this is enough to implement a split view gui.
+# For `Origin: null` specifically, /tabs is allowed from either member of the
+# split pair (so the background pane can poll), while /navigate requires the
+# requester to be the *active* (focused) file:// tab.
 # Localhost and no-Origin callers are unaffected.
 _LOCALHOST_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
 # Endpoints safe enough to also expose to the file:// (Origin: null) split-tab UI.
@@ -107,10 +108,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._json_response(200, json.dumps({"error": NO_SPLIT_TABS}))
                     return
                 active, tabs = _cached_tabs()
-                if not (active and active.get("url", "").startswith("file://")):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-                if self.headers.get("X-Tab-Url") != active.get("url"):
+                req_url = self.headers.get("X-Tab-Url") or ""
+                split_urls = {t.get("url") for t in tabs if t.get("id") in (active_id, partner_id)}
+                if not (req_url.startswith("file://") and req_url in split_urls):
                     self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
                     return
                 split_tabs = [t for t in tabs if t.get("id") in (active_id, partner_id)]

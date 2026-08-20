@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Native messaging host for Tab Share. Caches tabs pushed from the extension
-and serves them over HTTP on port 8765. Also relays commands back to the extension."""
+and serves them over HTTP on port 8766. Also relays commands back to the extension."""
 
 import json
 import re
@@ -16,7 +16,7 @@ pending = {}  # id -> threading.Event, result
 pending_lock = threading.Lock()
 write_lock = threading.Lock()
 
-PORT = 8765
+PORT = 8766
 
 # ---- CORS policy ----------------------------------------------------------
 # Localhost origins may reach every endpoint. The file:// interface (tracker.html
@@ -25,6 +25,11 @@ PORT = 8765
 # Sensitive endpoints (/eval, /open, /extract, /close, ...) are localhost-only.
 # curl (our agent) sends no Origin header and ignores CORS entirely, so it is
 # unaffected — this only constrains what browser pages of other origins can call.
+#
+# For `Origin: null` specifically, /tabs is allowed from either member of the
+# split pair (so the background pane can poll), while /navigate requires the
+# requester to be the *active* (focused) file:// tab.
+# Localhost and no-Origin callers are unaffected.
 _LOCALHOST_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
 # Endpoints safe enough to also expose to the file:// (Origin: null) split-tab UI.
 FILE_OK_PATHS = frozenset({"/tabs", "/navigate"})
@@ -95,10 +100,6 @@ def send_and_wait(msg, timeout=5):
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _is_null_origin(self):
-        """True only for the file:// (`Origin: null`) case this extra narrowing targets."""
-        return self.headers.get("Origin") == "null"
-
     def do_GET(self):
         if self.path == "/tabs":
             if self._is_null_origin():
@@ -107,10 +108,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._json_response(200, json.dumps({"error": NO_SPLIT_TABS}))
                     return
                 active, tabs = _cached_tabs()
-                if not (active and active.get("url", "").startswith("file://")):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-                if self.headers.get("X-Tab-Url") != active.get("url"):
+                req_url = self.headers.get("X-Tab-Url") or ""
+                split_urls = {t.get("url") for t in tabs if t.get("id") in (active_id, partner_id)}
+                if not (req_url.startswith("file://") and req_url in split_urls):
                     self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
                     return
                 split_tabs = [t for t in tabs if t.get("id") in (active_id, partner_id)]
@@ -270,6 +270,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data.encode() if isinstance(data, str) else data)
 
+    def _is_null_origin(self):
+        """True only for the file:// (`Origin: null`) case this extra narrowing targets.
+        Localhost origins and no-Origin (curl/agentic) callers are never true here, so
+        they reach /tabs and /navigate exactly as before."""
+        return self.headers.get("Origin") == "null"
+
     def _allowed_origin(self):
         """Return the Origin value to echo in Access-Control-Allow-Origin, or None
         if this origin isn't allowed to reach this path.
@@ -311,6 +317,19 @@ def run_server(httpd):
     httpd.serve_forever()
 
 
+def keepalive_pinger():
+    """Ping the extension every 20s. Receiving a native message resets the MV3 service
+    worker's idle timer, keeping it alive so live commands (/groups, /extract) don't
+    time out while the worker is dormant. The SW ignores type=="ping"."""
+    import time
+    while True:
+        time.sleep(20)
+        try:
+            send_message({"type": "ping"})
+        except Exception:
+            break
+
+
 def _pids_on_port(port):
     """Return PIDs (excluding ourselves) holding a LISTEN socket on `port`, via /proc."""
     import os, glob
@@ -347,7 +366,7 @@ def _pids_on_port(port):
 
 def _bind_newest_wins():
     """Bind PORT. If a stale host owns it, kill that host and retry (newest host wins,
-    because it is the one connected to the currently-live browser extension)."""
+    because it is the one connected to the currently-live MV3 service worker)."""
     import os, signal, time
     class ReusableHTTPServer(HTTPServer):
         allow_reuse_address = True
@@ -365,14 +384,15 @@ def _bind_newest_wins():
 
 
 if __name__ == "__main__":
-    # Newest-wins singleton: if a stale host holds the port, take it over so the
-    # currently-connected extension owns the HTTP server. Prevents zombie buildup
-    # across browser/extension restarts.
+    # Newest-wins singleton: the live service worker just spawned us, so we should own
+    # the port. If a stale host (whose SW has died) holds it, take it over. The live SW's
+    # open native-messaging port then keeps that SW alive so live commands don't time out.
     httpd = _bind_newest_wins()
     if httpd is None:
         sys.exit(0)
 
     threading.Thread(target=run_server, args=(httpd,), daemon=True).start()
+    threading.Thread(target=keepalive_pinger, daemon=True).start()
 
     while True:
         msg = read_message()
