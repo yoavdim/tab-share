@@ -22,7 +22,7 @@ PORT = 8766
 # Localhost origins may reach every endpoint. The file:// interface (tracker.html
 # split-tab view) is served from disk, so browsers send it as `Origin: null`; it
 # is only allowed to reach the low-risk endpoints it actually needs (/tabs, /navigate).
-# Sensitive endpoints (/eval, /open, /extract, /close, ...) are localhost-only.
+# Sensitive endpoints (/eval, /query, /scroll, /open, /extract, /close, ...) are localhost-only.
 # curl (our agent) sends no Origin header and ignores CORS entirely, so it is
 # unaffected — this only constrains what browser pages of other origins can call.
 #
@@ -30,8 +30,17 @@ PORT = 8766
 # split pair (so the background pane can poll), while /navigate requires the
 # requester to be the *active* (focused) file:// tab.
 # Localhost and no-Origin callers are unaffected.
+#
+# yoavdim.github.io is trusted the same as the file:// (null) case: same FILE_OK_PATHS
+# restriction, gated on the currently-focused tab actually being on that origin (see
+# _focused_tab_matches_origin) rather than the split-pair logic file:// uses. Since it's
+# a public HTTPS origin rather than file://, Chrome's Local Network Access also gates
+# it: the browser prompts the user once, and our preflight must send
+# Access-Control-Allow-Private-Network: true or the request is blocked regardless of ACAO.
 _LOCALHOST_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
-# Endpoints safe enough to also expose to the file:// (Origin: null) split-tab UI.
+TRUSTED_PUBLIC_ORIGINS = frozenset({"https://yoavdim.github.io"})
+# Endpoints safe enough to also expose to the file:// (Origin: null) split-tab UI,
+# and to TRUSTED_PUBLIC_ORIGINS.
 FILE_OK_PATHS = frozenset({"/tabs", "/navigate"})
 # Sentinel reasons returned to a null-origin caller instead of real tab data.
 NO_SPLIT_TABS = "NO_SPLIT_TABS"       # no split-view pair exists right now
@@ -102,6 +111,14 @@ def send_and_wait(msg, timeout=5):
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/tabs":
+            if self._is_trusted_public_origin():
+                if not self._focused_tab_matches_origin():
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+                with lock:
+                    data = state["data"]
+                self._json_response(200, data)
+                return
             if self._is_null_origin():
                 active_id, partner_id = _focused_split_pair()
                 if active_id is None:
@@ -189,12 +206,45 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(200, json.dumps(result))
             else:
                 self._json_response(504, json.dumps({"error": "timeout"}))
+        elif self.path == "/query":
+            # CSS-select in the page without the caller supplying JS. Unlike /eval this
+            # works on strict-CSP sites: the extension runs code it owns rather than
+            # evaluating a string in the page world.
+            selector = body.get("selector")
+            if not selector:
+                self._json_response(400, json.dumps({"error": "selector required"}))
+                return
+            msg = {"type": "query", "selector": selector}
+            for k in ("url", "tabId"):
+                if body.get(k) is not None:
+                    msg[k] = body[k]
+            result = send_and_wait(msg, timeout=45)
+            if result:
+                self._json_response(200, json.dumps(result))
+            else:
+                self._json_response(504, json.dumps({"error": "timeout"}))
+        elif self.path == "/scroll":
+            # Scroll the window (no selector) or a lazy-list container (selector),
+            # optionally mode="wiggle" to restart a stalled lazy-loader.
+            msg = {"type": "scroll"}
+            for k in ("url", "tabId", "selector", "mode"):
+                if body.get(k) is not None:
+                    msg[k] = body[k]
+            result = send_and_wait(msg, timeout=45)
+            if result:
+                self._json_response(200, json.dumps(result))
+            else:
+                self._json_response(504, json.dumps({"error": "timeout"}))
         elif self.path == "/navigate":
             url = body.get("url")
             if not url:
                 self._json_response(400, json.dumps({"error": "url required"}))
                 return
-            if self._is_null_origin():
+            if self._is_trusted_public_origin():
+                if not self._focused_tab_matches_origin():
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+            elif self._is_null_origin():
                 # file:// pages may only redirect the focused tab's split partner.
                 active_id, partner_id = _focused_split_pair()
                 if active_id is None:
@@ -276,6 +326,19 @@ class Handler(BaseHTTPRequestHandler):
         they reach /tabs and /navigate exactly as before."""
         return self.headers.get("Origin") == "null"
 
+    def _is_trusted_public_origin(self):
+        """True only for TRUSTED_PUBLIC_ORIGINS (e.g. yoavdim.github.io)."""
+        return self.headers.get("Origin") in TRUSTED_PUBLIC_ORIGINS
+
+    def _focused_tab_matches_origin(self):
+        """True if the browser's currently-focused tab is actually on the caller's
+        declared Origin. This is the real gate for TRUSTED_PUBLIC_ORIGINS requests:
+        proves the request is coming from a tab the user is looking at right now, on
+        that origin, rather than any script that merely knows the Origin string."""
+        origin = self.headers.get("Origin") or ""
+        active, _ = _cached_tabs()
+        return bool(active) and (active.get("url") or "").startswith(origin + "/")
+
     def _allowed_origin(self):
         """Return the Origin value to echo in Access-Control-Allow-Origin, or None
         if this origin isn't allowed to reach this path.
@@ -284,6 +347,8 @@ class Handler(BaseHTTPRequestHandler):
           and the caller emits no ACAO header (CORS is irrelevant without an Origin).
         - localhost/127.0.0.1 origins: allowed on every endpoint.
         - file:// pages (sent as `Origin: null`): allowed only on FILE_OK_PATHS.
+        - TRUSTED_PUBLIC_ORIGINS (e.g. yoavdim.github.io): allowed only on FILE_OK_PATHS,
+          same as file://.
         - anything else: denied.
         """
         origin = self.headers.get("Origin")
@@ -294,6 +359,8 @@ class Handler(BaseHTTPRequestHandler):
             return origin
         if origin == "null" and path in FILE_OK_PATHS:
             return "null"
+        if origin in TRUSTED_PUBLIC_ORIGINS and path in FILE_OK_PATHS:
+            return origin
         return False  # explicitly disallowed
 
     def _cors_headers(self):
@@ -308,6 +375,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Tab-Url")
+        if allowed in TRUSTED_PUBLIC_ORIGINS:
+            # Chrome's Local Network Access: a public HTTPS origin reaching a
+            # localhost/private-network server also needs this on top of ACAO, or
+            # the browser blocks the request regardless (separate from CORS).
+            self.send_header("Access-Control-Allow-Private-Network", "true")
 
     def log_message(self, *_):
         pass

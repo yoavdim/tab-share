@@ -112,6 +112,95 @@ async function handleEval(msg) {
   }
 }
 
+// CSP-safe alternative to /eval: runs the extension's own DOM code, not a caller string.
+// Keep in sync with chromium/background.js.
+function queryElements(selector) {
+  let els;
+  try {
+    els = document.querySelectorAll(selector);
+  } catch (e) {
+    return { error: "invalid selector: " + String(e) };
+  }
+  const items = Array.from(els, el => el.outerHTML);
+  return { count: items.length, items: items, ready: document.readyState };
+}
+
+// Scroll to the bottom of the window, or of the first match's innermost scrollable
+// ancestor. mode "wiggle" nudges up first to restart a stalled lazy-loader.
+function scrollPage(selector, mode) {
+  try {
+    if (!selector) {
+      window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
+      return { ok: true, position: "window", ready: document.readyState };
+    }
+    let c;
+    try {
+      c = document.querySelector(selector);
+    } catch (e) {
+      return { error: "invalid selector: " + String(e) };
+    }
+    if (!c) return { ok: true, position: "no-match", ready: document.readyState };
+    let el = c;
+    while (el && el.scrollHeight <= el.clientHeight + 50 && el.parentElement) {
+      el = el.parentElement;
+    }
+    if (mode === "wiggle") {
+      // Unconditional: the point is to jolt a stalled loader even when the walk
+      // found nothing scrollable.
+      if (!el) return { ok: true, position: "none", ready: document.readyState };
+      el.scrollTop = Math.max(0, el.scrollTop - 600);
+      el.scrollTop = el.scrollHeight;
+      return { ok: true, position: el.scrollTop + "/" + el.scrollHeight,
+               ready: document.readyState };
+    }
+    // Only scroll a genuinely scrollable ancestor — otherwise the walk's fallback
+    // (documentElement) would scroll the whole page instead.
+    if (el && el.scrollHeight > el.clientHeight + 50) el.scrollTop = el.scrollHeight;
+    return { ok: true,
+             position: el ? (el.scrollTop + "/" + el.scrollHeight) : "none",
+             ready: document.readyState };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+// Serialize a page op for MV2's `code:` API. Args are JSON-encoded, so a selector
+// containing quotes cannot break out of the source.
+function pageOpSource(fn, args) {
+  const encoded = (args || [])
+    .map(a => JSON.stringify(a === undefined ? null : a))
+    .join(",");
+  return "(" + fn.toString() + ")(" + encoded + ")";
+}
+
+async function handleQuery(msg) {
+  try {
+    const tab = await resolveTab(msg);
+    if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
+    const results = await browser.tabs.executeScript(tab.id, {
+      code: pageOpSource(queryElements, [msg.selector]),
+    });
+    const out = results && results.length ? results[0] : null;
+    port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id, url: tab.url, result: out });
+  } catch (e) {
+    port.postMessage({ type: "result", id: msg.id, error: e.message });
+  }
+}
+
+async function handleScroll(msg) {
+  try {
+    const tab = await resolveTab(msg);
+    if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
+    const results = await browser.tabs.executeScript(tab.id, {
+      code: pageOpSource(scrollPage, [msg.selector || null, msg.mode || null]),
+    });
+    const out = results && results.length ? results[0] : null;
+    port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id, url: tab.url, result: out });
+  } catch (e) {
+    port.postMessage({ type: "result", id: msg.id, error: e.message });
+  }
+}
+
 async function handleNavigate(msg) {
   try {
     const win = await browser.windows.getCurrent();
@@ -222,6 +311,8 @@ async function handleCommand(msg) {
   if (msg.type === "open") return handleOpen(msg);
   if (msg.type === "containers") return handleContainers(msg);
   if (msg.type === "eval") return handleEval(msg);
+  if (msg.type === "query") return handleQuery(msg);
+  if (msg.type === "scroll") return handleScroll(msg);
   if (msg.type === "navigate") return handleNavigate(msg);
   if (msg.type === "extract") return handleExtract(msg);
   if (msg.type === "close") return handleClose(msg);

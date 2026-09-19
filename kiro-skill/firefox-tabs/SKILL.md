@@ -103,6 +103,39 @@ Closes tabs, but only ones matching **all** guards (prevents closing the wrong t
 A concrete `expectGroup` (a real name) with no `tabId`/`url` closes **every tab in that group**.
 Returns `{ ok, closed:[ids], rejected:[{id, why}] }`.
 
+### Read Element Markup by CSS Selector
+
+```bash
+curl -s -X POST http://localhost:8765/query \
+  -H 'Content-Type: application/json' \
+  -d '{"tabId": 12, "selector": "a.result-link"}' | jq .
+```
+
+- `selector` (**required**): CSS selector to match.
+- `tabId`: tab to read (from `/tabs`); defaults to the active tab.
+
+Returns `{ ok, result: { count, items, ready } }`, where `items` is the `outerHTML` of each
+match in document order, taken from the live DOM. Target the narrowest element you need — a
+selector pointing at a container returns its entire subtree. `ready` is the tab's
+`document.readyState`. An invalid selector returns `{ error: "invalid selector: ..." }`.
+
+### Scroll (lazy-loaded lists)
+
+```bash
+curl -s -X POST http://localhost:8765/scroll \
+  -H 'Content-Type: application/json' \
+  -d '{"tabId": 12, "selector": "[data-testid=list-item]"}' | jq .
+```
+
+- `tabId`: tab to scroll; defaults to the active tab.
+- `selector`: omit to scroll the **window**; with one, scrolls the innermost scrollable
+  ancestor of the first match (the list container) instead.
+- `mode`: `"wiggle"` nudges up ~600px before jumping to the bottom, restarting a stalled
+  lazy-loader.
+
+Returns `{ ok, position, ready }` — `position` is `"scrollTop/scrollHeight"`, or
+`"no-match"` when the selector matched nothing.
+
 > **CORS:** `localhost` origins reach every endpoint; `file://` pages only `/tabs` + `/navigate`; other websites are denied. `curl` is unaffected.
 
 ## Workflow for Opening Tabs in Groups

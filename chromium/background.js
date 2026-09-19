@@ -144,6 +144,92 @@ async function handleExtract(msg) {
   }
 }
 
+// ---- CSP-safe DOM access (/query, /scroll) ---------------------------------
+
+// CSP-safe alternative to /eval: runs in the extension's isolated world.
+// Keep in sync with firefox/background.js.
+function queryElements(selector) {
+  let els;
+  try {
+    els = document.querySelectorAll(selector);
+  } catch (e) {
+    return { error: "invalid selector: " + String(e) };
+  }
+  const items = Array.from(els, el => el.outerHTML);
+  return { count: items.length, items: items, ready: document.readyState };
+}
+
+// Scroll to the bottom of the window, or of the first match's innermost scrollable
+// ancestor. mode "wiggle" nudges up first to restart a stalled lazy-loader.
+function scrollPage(selector, mode) {
+  try {
+    if (!selector) {
+      window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
+      return { ok: true, position: "window", ready: document.readyState };
+    }
+    let c;
+    try {
+      c = document.querySelector(selector);
+    } catch (e) {
+      return { error: "invalid selector: " + String(e) };
+    }
+    if (!c) return { ok: true, position: "no-match", ready: document.readyState };
+    let el = c;
+    while (el && el.scrollHeight <= el.clientHeight + 50 && el.parentElement) {
+      el = el.parentElement;
+    }
+    if (mode === "wiggle") {
+      // Unconditional: the point is to jolt a stalled loader even when the walk
+      // found nothing scrollable.
+      if (!el) return { ok: true, position: "none", ready: document.readyState };
+      el.scrollTop = Math.max(0, el.scrollTop - 600);
+      el.scrollTop = el.scrollHeight;
+      return { ok: true, position: el.scrollTop + "/" + el.scrollHeight,
+               ready: document.readyState };
+    }
+    // Only scroll a genuinely scrollable ancestor — otherwise the walk's fallback
+    // (documentElement) would scroll the whole page instead.
+    if (el && el.scrollHeight > el.clientHeight + 50) el.scrollTop = el.scrollHeight;
+    return { ok: true,
+             position: el ? (el.scrollTop + "/" + el.scrollHeight) : "none",
+             ready: document.readyState };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+async function handleQuery(msg) {
+  try {
+    const tab = await resolveTab(msg);
+    if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: queryElements,
+      args: [msg.selector],
+    });
+    const out = results && results.length ? results[0].result : null;
+    port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id, url: tab.url, result: out });
+  } catch (e) {
+    port.postMessage({ type: "result", id: msg.id, error: e.message });
+  }
+}
+
+async function handleScroll(msg) {
+  try {
+    const tab = await resolveTab(msg);
+    if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: scrollPage,
+      args: [msg.selector || null, msg.mode || null],
+    });
+    const out = results && results.length ? results[0].result : null;
+    port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id, url: tab.url, result: out });
+  } catch (e) {
+    port.postMessage({ type: "result", id: msg.id, error: e.message });
+  }
+}
+
 // MV3 cannot inject arbitrary code strings. We wrap the requested code in a function
 // that evals it in the page world. This requires the page CSP to allow it; on strict-CSP
 // pages /eval may fail — prefer /extract for content scraping.
@@ -278,6 +364,8 @@ function handleCommand(msg) {
     case "open": return handleOpen(msg);
     case "containers": return handleContainers(msg);
     case "eval": return handleEval(msg);
+    case "query": return handleQuery(msg);
+    case "scroll": return handleScroll(msg);
     case "navigate": return handleNavigate(msg);
     case "extract": return handleExtract(msg);
     case "group": return handleGroup(msg);

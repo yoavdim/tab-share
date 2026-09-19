@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Tab Share",
-  "version": "2.8",
+  "version": "2.9",
   "description": "Share and manage tabs via local HTTP API",
   "permissions": ["tabs", "tabGroups", "nativeMessaging", "contextualIdentities", "cookies", "downloads", "<all_urls>"],
   "browser_action": {

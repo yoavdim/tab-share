@@ -108,6 +108,58 @@ curl -s -X POST http://localhost:8765/group \
 | `tabUrl` | `string` | Exact URL of the tab to group |
 | `groupName` | `string` | Name of the group (created if it doesn't exist) |
 
+### `POST /query`
+
+Returns the `outerHTML` of every element matching a CSS selector, without the caller
+supplying any JavaScript.
+
+```bash
+curl -s -X POST http://localhost:8765/query \
+  -H 'Content-Type: application/json' \
+  -d '{"tabId": 12, "selector": "a.result-link"}' | jq
+```
+
+```json
+{ "ok": true, "tabId": 12, "result": {
+    "count": 2,
+    "items": [ "<a class=\"result-link\" href=\"/items/1\">First result</a>",
+               "<a class=\"result-link\" href=\"/items/2\">Second result</a>" ],
+    "ready": "complete" } }
+```
+
+| Field      | Type     | Description                                             |
+| ------------| ----------| ---------------------------------------------------------|
+| `selector` | `string` | **Required.** CSS selector to match.                    |
+| `tabId`    | `int`    | Tab to read (from `/tabs`). Defaults to the active tab. |
+
+`items` holds the serialized markup of each match, in document order, reflecting the live
+DOM after any scripts have run. Attributes come back as authored, so relative URLs stay
+relative. `ready` is the tab's `document.readyState`, so one call can both read elements and
+check whether the page has finished loading. An invalid selector comes back as
+`{ "error": "invalid selector: ..." }`.
+
+Target the narrowest element you need: a selector pointing at a container returns that
+container's entire subtree.
+
+### `POST /scroll`
+
+Scrolls to the bottom — useful for lazy-loading lists that only fetch more on scroll.
+
+```bash
+curl -s -X POST http://localhost:8765/scroll \
+  -H 'Content-Type: application/json' \
+  -d '{"tabId": 12, "selector": "[data-testid=list-item]"}' | jq
+```
+
+| Field      | Type     | Description                                                                                                                         |
+| ------------| ----------| -------------------------------------------------------------------------------------------------------------------------------------|
+| `tabId`    | `int`    | Tab to scroll (from `/tabs`). Defaults to the active tab.                                                                           |
+| `selector` | `string` | Omit to scroll the **window**. With one, scrolls the innermost scrollable ancestor of the first match (the list container) instead. |
+| `mode`     | `string` | `"wiggle"` nudges up ~600px before jumping to the bottom, which restarts a lazy-loader that has stalled.                            |
+
+Returns `{ ok, position, ready }`, where `position` is `"scrollTop/scrollHeight"`, or
+`"no-match"` when the selector matched nothing.
+
 The host also exposes `/open`, `/navigate`, `/extract`, `/eval`, `/groups`, `/containers`,
 and the safety-gated `/close` (below).
 
@@ -155,7 +207,7 @@ call it (both builds behave the same):
   manipulation. They can only reach `/tabs` and `/navigate`, and **only** if the currently
   active tab is a `file://` URL that is part of a split-view pair. They must also send a matching `X-Tab-Url` header. The API strictly sandboxes
   the payload, meaning the `file://` page can only see and navigate its specific split-view
-  partner. Sensitive endpoints (`/eval`, `/open`, `/extract`, `/close`, `/group`) are completely blocked.
+  partner. Sensitive endpoints (`/eval`, `/query`, `/scroll`, `/open`, `/extract`, `/close`, `/group`) are completely blocked.
 - **Any other website** — denied on all endpoints, so a random page you visit can't drive
   your browser.
 - **`curl` / non-browser clients** send no `Origin` header and are unaffected — CORS only

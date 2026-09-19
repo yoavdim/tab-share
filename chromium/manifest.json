@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tab Share (Chromium)",
-  "version": "2.10",
+  "version": "2.11",
   "description": "Share and manage tabs via local HTTP API",
   "permissions": ["tabs", "tabGroups", "nativeMessaging", "scripting", "alarms"],
   "host_permissions": ["<all_urls>"],
