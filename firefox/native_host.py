@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Native messaging host for Tab Share. Caches tabs pushed from the extension
-and serves them over HTTP on port 8765. Also relays commands back to the extension."""
+and serves them over HTTP on port 8766. Also relays commands back to the extension."""
 
+import atexit
 import json
+import os
 import re
+import secrets
 import struct
+import subprocess
 import sys
 import threading
+import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -16,13 +21,14 @@ pending = {}  # id -> threading.Event, result
 pending_lock = threading.Lock()
 write_lock = threading.Lock()
 
-PORT = 8765
+PORT = 8766
 
 # ---- CORS policy ----------------------------------------------------------
 # Localhost origins may reach every endpoint. The file:// interface (tracker.html
 # split-tab view) is served from disk, so browsers send it as `Origin: null`; it
-# is only allowed to reach the low-risk endpoints it actually needs (/tabs, /navigate).
-# Sensitive endpoints (/eval, /query, /scroll, /open, /extract, /close, ...) are localhost-only.
+# is only allowed to reach the low-risk endpoints it actually needs (/tabs, /navigate,
+# /opencode — see EMBED_OK_PATHS below). Other sensitive endpoints (/eval, /query,
+# /scroll, /open, /extract, /close, ...) are localhost-only.
 # curl (our agent) sends no Origin header and ignores CORS entirely, so it is
 # unaffected — this only constrains what browser pages of other origins can call.
 #
@@ -42,9 +48,157 @@ TRUSTED_PUBLIC_ORIGINS = frozenset({"https://yoavdim.github.io"})
 # Endpoints safe enough to also expose to the file:// (Origin: null) split-tab UI,
 # and to TRUSTED_PUBLIC_ORIGINS.
 FILE_OK_PATHS = frozenset({"/tabs", "/navigate"})
+# /opencode is gated separately (its own tab-focus check), but still needs to be
+# listed here so _allowed_origin lets the browser read its response.
+EMBED_OK_PATHS = frozenset({"/opencode"})
 # Sentinel reasons returned to a null-origin caller instead of real tab data.
 NO_SPLIT_TABS = "NO_SPLIT_TABS"       # no split-view pair exists right now
 NOT_ALLOWED = "NOT_ALLOWED"           # target tab isn't the focused tab or its partner
+
+# ---- /opencode: one `opencode serve` per workspace folder -----------------
+# Runs `opencode serve` with cwd=<folder> (or $HOME if omitted), protected by a
+# random per-folder password. Reuses a running, healthy server for the same real
+# path; idle ones are reaped after _EMBED_IDLE_SECONDS.
+_HOME = os.path.realpath(os.path.expanduser("~"))
+_EMBED_IDLE_SECONDS = 20 * 60
+_embed_lock = threading.Lock()
+_embed_servers = {}     # real_path -> {proc, port, password, deadline}
+_embed_starting = set()  # real_path currently starting, to dedupe concurrent callers
+_embed_start_lock = threading.Lock()  # opencode serve shares one sqlite db; serialize starts
+
+def cleanup_embeds():
+    with _embed_lock:
+        for folder, info in _embed_servers.items():
+            try:
+                info["proc"].terminate()
+            except:
+                pass
+atexit.register(cleanup_embeds)
+
+
+def _resolve_under_home(path):
+    """realpath(path) if under $HOME (symlinks resolved first), else None."""
+    if not path:
+        return None
+    real = os.path.realpath(os.path.expanduser(path))
+    if real == _HOME or real.startswith(_HOME + os.sep):
+        return real
+    return None
+
+
+def _terminate(proc):
+    """terminate(), waiting so the child is actually reaped; escalates to kill()."""
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _reap_embed_servers():
+    """Every minute, terminate any embed server past its idle deadline."""
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with _embed_lock:
+            dead = [k for k, v in _embed_servers.items() if v["deadline"] < now]
+            for k in dead:
+                info = _embed_servers.pop(k)
+                send_message({"type": "removeEmbedAuth", "port": info["port"]})
+                threading.Thread(target=_terminate, args=(info["proc"],), daemon=True).start()
+
+
+def _free_port():
+    """An ephemeral port free right now (opencode serve doesn't report --port 0's pick)."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _is_healthy(port, password, timeout=1.5):
+    """True if /global/health answers 200. Auth required: OPENCODE_SERVER_PASSWORD
+    protects every endpoint including health, so this must send it too."""
+    import base64
+    import urllib.request
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/global/health")
+    creds = base64.b64encode(f"opencode:{password}".encode()).decode()
+    req.add_header("Authorization", f"Basic {creds}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _start_embed_server(real_path):
+    """Launch `opencode serve` in real_path with a fresh password; block until healthy
+    or raise RuntimeError. Serialized globally: concurrent opencode serve instances
+    contend on one shared sqlite db and can otherwise time out spuriously."""
+    with _embed_start_lock:
+        password = secrets.token_urlsafe(24)
+        env = dict(os.environ)
+        env["OPENCODE_SERVER_PASSWORD"] = password
+        env["PYTHONUNBUFFERED"] = "1"
+        port = _free_port()
+        # Open a log file for opencode serve so we can debug
+        log_file = open(os.path.expanduser("~/.opencode_serve.log"), "a")
+        proc = subprocess.Popen(
+            ["opencode", "serve", "--port", str(port), "--hostname", "127.0.0.1"],
+            cwd=real_path, env=env,
+            stdout=log_file, stderr=subprocess.STDOUT,
+        )
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"opencode serve exited (code {proc.returncode}) before becoming healthy")
+            if _is_healthy(port, password):
+                return proc, port, password
+            time.sleep(0.3)
+        _terminate(proc)
+        raise RuntimeError("opencode serve did not become healthy in time")
+
+
+def _get_or_start_embed(real_path):
+    """{port, password} for real_path: reuse a healthy running server, or start one.
+    `_embed_starting` makes a second concurrent caller for the same folder wait and
+    re-check the cache instead of starting a duplicate server."""
+    while True:
+        with _embed_lock:
+            info = _embed_servers.get(real_path)
+            healthy = (info is not None and info["proc"].poll() is None
+                       and _is_healthy(info["port"], info["password"]))
+            if healthy:
+                info["deadline"] = time.time() + _EMBED_IDLE_SECONDS
+                return {"port": info["port"], "password": info["password"]}
+            if info is not None:
+                threading.Thread(target=_terminate, args=(info["proc"],), daemon=True).start()
+                del _embed_servers[real_path]
+            if real_path not in _embed_starting:
+                _embed_starting.add(real_path)
+                break
+        time.sleep(0.2)
+
+    try:
+        # Started outside _embed_lock (blocks up to ~15s); _embed_starting serializes
+        # callers for this folder instead.
+        proc, port, password = _start_embed_server(real_path)
+        with _embed_lock:
+            _embed_servers[real_path] = {
+                "proc": proc, "port": port, "password": password,
+                "deadline": time.time() + _EMBED_IDLE_SECONDS,
+            }
+        return {"port": port, "password": password}
+    finally:
+        with _embed_lock:
+            _embed_starting.discard(real_path)
 
 
 def _cached_tabs():
@@ -235,6 +389,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(200, json.dumps(result))
             else:
                 self._json_response(504, json.dumps({"error": "timeout"}))
+
         elif self.path == "/navigate":
             url = body.get("url")
             if not url:
@@ -357,9 +512,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if _LOCALHOST_ORIGIN_RE.match(origin):
             return origin
-        if origin == "null" and path in FILE_OK_PATHS:
+        if origin == "null" and path in (FILE_OK_PATHS | EMBED_OK_PATHS):
             return "null"
-        if origin in TRUSTED_PUBLIC_ORIGINS and path in FILE_OK_PATHS:
+        if origin in TRUSTED_PUBLIC_ORIGINS and path in (FILE_OK_PATHS | EMBED_OK_PATHS):
             return origin
         return False  # explicitly disallowed
 
@@ -387,6 +542,19 @@ class Handler(BaseHTTPRequestHandler):
 
 def run_server(httpd):
     httpd.serve_forever()
+
+
+def keepalive_pinger():
+    """Ping the extension every 20s. Receiving a native message resets the MV3 service
+    worker's idle timer, keeping it alive so live commands (/groups, /extract) don't
+    time out while the worker is dormant. The SW ignores type=="ping"."""
+    import time
+    while True:
+        time.sleep(20)
+        try:
+            send_message({"type": "ping"})
+        except Exception:
+            break
 
 
 def _pids_on_port(port):
@@ -425,7 +593,7 @@ def _pids_on_port(port):
 
 def _bind_newest_wins():
     """Bind PORT. If a stale host owns it, kill that host and retry (newest host wins,
-    because it is the one connected to the currently-live browser extension)."""
+    because it is the one connected to the currently-live MV3 service worker)."""
     import os, signal, time
     class ReusableHTTPServer(HTTPServer):
         allow_reuse_address = True
@@ -443,14 +611,16 @@ def _bind_newest_wins():
 
 
 if __name__ == "__main__":
-    # Newest-wins singleton: if a stale host holds the port, take it over so the
-    # currently-connected extension owns the HTTP server. Prevents zombie buildup
-    # across browser/extension restarts.
+    # Newest-wins singleton: the live service worker just spawned us, so we should own
+    # the port. If a stale host (whose SW has died) holds it, take it over. The live SW's
+    # open native-messaging port then keeps that SW alive so live commands don't time out.
     httpd = _bind_newest_wins()
     if httpd is None:
         sys.exit(0)
 
     threading.Thread(target=run_server, args=(httpd,), daemon=True).start()
+    threading.Thread(target=keepalive_pinger, daemon=True).start()
+    threading.Thread(target=_reap_embed_servers, daemon=True).start()
 
     while True:
         msg = read_message()
@@ -470,6 +640,31 @@ if __name__ == "__main__":
                     "activeTab": data.get("activeTab"),
                     "tabs": data.get("tabs", []),
                 })
+        elif data.get("type") == "startOpencode":
+            def _start_opencode(d):
+                tab_id = d.get("tabId")
+                path = d.get("path")
+                url = d.get("url")
+                real = _HOME
+                if url and url.startswith("file://"):
+                    req_path = urllib.request.url2pathname(url[7:])
+                    if os.path.isfile(req_path):
+                        req_path = os.path.dirname(req_path)
+                    r = _resolve_under_home(req_path)
+                    if r and os.path.isdir(r):
+                        real = r
+                elif path:
+                    r = _resolve_under_home(path)
+                    if r and os.path.isdir(r):
+                        real = r
+                try:
+                    info = _get_or_start_embed(real)
+                    send_message({"type": "injectEmbedAuth", "port": info["port"],
+                                  "password": info["password"], "tabId": tab_id, "path": real})
+                    send_message({"type": "openSidePanel", "tabId": tab_id, "port": info["port"]})
+                except Exception as e:
+                    send_message({"type": "openSidePanelError", "error": str(e)})
+            threading.Thread(target=_start_opencode, args=(data,), daemon=True).start()
         else:
             # Legacy: raw tab data without type field
             with lock:

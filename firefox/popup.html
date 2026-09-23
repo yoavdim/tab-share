@@ -9,6 +9,12 @@
     .endpoint { margin: 6px 0; }
     .method { font-weight: bold; color: #333; }
     .status { color: #666; font-size: 12px; margin-top: 10px; }
+    #toggle-panel {
+      display: none; margin-top: 10px; width: 100%; padding: 7px 0;
+      border: 1px solid #ccc; border-radius: 6px; background: #f8f8f8;
+      font-size: 13px; cursor: pointer; font-family: inherit;
+    }
+    #toggle-panel:hover { background: #eee; }
   </style>
 </head>
 <body>
@@ -16,6 +22,8 @@
   <div class="endpoint"><span class="method">GET</span> <code>/tabs</code> — list open tabs</div>
   <div class="endpoint"><span class="method">GET</span> <code>/groups</code> — list tab groups</div>
   <div class="endpoint"><span class="method">POST</span> <code>/group</code> — add tab to group</div>
+
+  <button id="toggle-panel">⚡ Toggle opencode panel</button>
   <div class="status" id="status">Checking...</div>
   <script>
     fetch("http://localhost:8765/tabs").then(r => r.json()).then(d => {
@@ -24,6 +32,19 @@
     }).catch(() => {
       document.getElementById("status").textContent = "✗ Native host not responding";
     });
+
+    // Show toggle button if there are active opencode sessions
+    browser.runtime.sendMessage({ type: "getEmbeds" }).then(res => {
+      if (res && res.servers && res.servers.length > 0) {
+        document.getElementById("toggle-panel").style.display = "block";
+      }
+    }).catch(() => {});
+
+    document.getElementById("toggle-panel").addEventListener("click", () => {
+      browser.sidebarAction.toggle();
+      window.close();
+    });
   </script>
 </body>
 </html>
+

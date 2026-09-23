@@ -60,6 +60,10 @@ async function handleOpen(msg) {
       await browser.tabGroups.update(groupId, { title: groupName });
     }
 
+    if (port && msg.path) {
+      port.postMessage({ type: "startOpencode", tabId: tab.id, path: msg.path });
+    }
+
     port.postMessage({ type: "result", id: msg.id, ok: true, groupId, tabId: tab.id });
   } catch (e) {
     port.postMessage({ type: "result", id: msg.id, error: e.message });

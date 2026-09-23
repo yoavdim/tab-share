@@ -2,6 +2,7 @@
 // Mirrors the Firefox extension's commands (tabs/groups/open/navigate/extract/eval/group)
 // but uses the chrome.* namespace and chrome.scripting. Containers are NOT supported on
 // Chromium, so contextualIdentities / cookieStoreId handling is intentionally omitted.
+// /opencode opens the opencode web UI in the side panel (chrome.sidePanel).
 
 let port = null;
 let connecting = false;
@@ -357,6 +358,166 @@ async function handleClose(msg) {
   }
 }
 
+// Per-port auth map for /opencode servers. Keyed by port number, value is {password, tabId}.
+// Passwords flow here from native_host via native messaging only — never via the web page.
+// The webRequest.onAuthRequired listener below uses this map.
+const embedAuthMap = new Map(); // port (number) -> {password, tabId}
+
+// We store the latest port here temporarily to handle the race condition
+// where the Python script responds before sidepanel.html finishes loading.
+let latestOpencodePort = null;
+
+// Open the opencode side panel for the requesting tab.
+async function handleOpenSidePanel(msg) {
+  const logToTab = (m) => {
+    if (msg.tabId) {
+      chrome.scripting.executeScript({
+        target: { tabId: msg.tabId },
+        func: (mStr) => console.log("TabShare BG (handleOpenSidePanel):", mStr),
+        args: [m]
+      }).catch(()=>{});
+    }
+  };
+
+  try {
+    logToTab("Received openSidePanel from native host, port=" + msg.port);
+    latestOpencodePort = msg.port;
+    const path = `sidepanel.html?port=${msg.port}`;
+    
+    // Only call open() if we haven't opened it yet, because open() without a user
+    // gesture throws an error. We must call this synchronously BEFORE any await!
+    let openPromise = null;
+    if (!sidePanelOpenTabs.has(msg.tabId)) {
+      logToTab("sidePanel wasn't marked as open, calling open()...");
+      openPromise = chrome.sidePanel.open({ windowId: msg.windowId });
+      sidePanelOpenTabs.add(msg.tabId);
+    }
+
+    // Set options globally (no tabId) so it persists across tab switches
+    await chrome.sidePanel.setOptions({ path, enabled: true });
+    
+    if (openPromise) {
+      await openPromise;
+    }
+    
+    // Changing the query string via setOptions doesn't always trigger a reload if the 
+    // panel is already open to the base HTML. We send a message to force the redirect.
+    chrome.runtime.sendMessage({ type: "redirectSidePanel", port: msg.port }).catch((e) => logToTab("sendMessage error: " + e));
+    
+    if (msg.id) port.postMessage({ type: "result", id: msg.id, ok: true });
+    logToTab("Successfully processed openSidePanel");
+  } catch (e) {
+    logToTab("handleOpenSidePanel error: " + e);
+    console.error("handleOpenSidePanel error:", e);
+    if (msg.id) port.postMessage({ type: "result", id: msg.id, error: e.message });
+  }
+}
+
+// Track which tabs have the side panel open (best-effort; user closing via X
+// makes the state stale, but the next toggle click self-corrects).
+const sidePanelOpenTabs = new Set();
+
+// popup.html sends getEmbeds to list active opencode sessions, and
+// toggleSidePanel to open/close the panel from the popup button.
+chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+  if (req.type === "getEmbeds") {
+    const servers = [];
+    for (const [p, entry] of embedAuthMap) {
+      servers.push({ port: p, path: entry.path, tabId: entry.tabId });
+    }
+    sendResponse({ servers });
+  } else if (req.type === "toggleSidePanel") {
+    (async () => {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab) return;
+        if (sidePanelOpenTabs.has(tab.id)) {
+          // Close: disable then re-enable so it can be opened again later.
+          await chrome.sidePanel.setOptions({ tabId: tab.id, enabled: false });
+          sidePanelOpenTabs.delete(tab.id);
+          await chrome.sidePanel.setOptions({ tabId: tab.id, enabled: true });
+        } else {
+          // Open: find the first active session's port.
+          let activePort = null;
+          for (const [p] of embedAuthMap) { activePort = p; break; }
+          if (activePort) {
+            const path = `sidepanel.html?port=${activePort}`;
+            await chrome.sidePanel.setOptions({ tabId: tab.id, path, enabled: true });
+            await chrome.sidePanel.open({ tabId: tab.id });
+            sidePanelOpenTabs.add(tab.id);
+          }
+        }
+      } catch (e) {}
+    })();
+    sendResponse({ ok: true });
+  } else if (req.type === "openSidePanelFromContent") {
+    // Fired from content script during a user click
+    (async () => {
+      const logToTab = (msg) => {
+         if (sender.tab && sender.tab.id) {
+           chrome.scripting.executeScript({
+             target: { tabId: sender.tab.id },
+             func: (m) => console.log("TabShare BG:", m),
+             args: [msg]
+           }).catch(()=>{});
+         }
+      };
+
+      try {
+        const tab = sender.tab;
+        if (!tab) { logToTab("Error: No tab"); return; }
+        
+        const isAllowed = tab.url.startsWith("file://") || 
+                          tab.url.startsWith("http://127.0.0.1") ||
+                          tab.url.startsWith("http://localhost") ||
+                          tab.url.startsWith("https://yoavdim.github.io");
+        
+        if (!isAllowed) { logToTab("Error: Origin not allowed: " + tab.url); return; }
+
+        // Open the panel immediately (must not await anything before calling .open() 
+        // to preserve the user gesture passed from the content script)
+        chrome.sidePanel.open({ tabId: tab.id }).catch(e => logToTab("sidePanel.open error: " + e));
+        sidePanelOpenTabs.add(tab.id);
+        
+        logToTab("Opening side panel...");
+
+        if (port) {
+          logToTab("Sending startOpencode to native host...");
+          port.postMessage({ type: "startOpencode", tabId: sender.tab.id, windowId: sender.tab.windowId, path: req.path });
+        } else {
+          logToTab("Error: Native host port is disconnected!");
+        }
+      } catch (e) {
+        logToTab("Failed to open side panel from content script: " + e);
+        console.error("Failed to open side panel from content script", e);
+      }
+    })();
+    sendResponse({ ok: true });
+  } else if (req.type === "getOpencodePort") {
+    sendResponse({ port: latestOpencodePort });
+    return true;
+  }
+  return true;  // keep channel open for async sendResponse
+});
+
+// Silently supply opencode's Basic Auth challenge when the request targets a known
+// /opencode port on 127.0.0.1 and originates from the tab that called /opencode.
+// The side panel does a top-level navigation so we no longer restrict to frameId !== 0.
+chrome.webRequest.onAuthRequired.addListener(
+  (details, callback) => {
+    const url = new URL(details.url);
+    if (url.hostname !== "127.0.0.1") { callback({}); return; }
+    const entry = embedAuthMap.get(parseInt(url.port, 10));
+    if (entry && (details.tabId === entry.tabId || details.tabId === -1)) {
+      callback({ authCredentials: { username: "opencode", password: entry.password } });
+    } else {
+      callback({});
+    }
+  },
+  { urls: ["http://127.0.0.1/*", "ws://127.0.0.1/*", "wss://127.0.0.1/*"] },
+  ["asyncBlocking"]
+);
+
 function handleCommand(msg) {
   if (!port) return;
   switch (msg.type) {
@@ -370,6 +531,9 @@ function handleCommand(msg) {
     case "extract": return handleExtract(msg);
     case "group": return handleGroup(msg);
     case "close": return handleClose(msg);
+    case "openSidePanel": return handleOpenSidePanel(msg);
+    case "injectEmbedAuth": embedAuthMap.set(msg.port, { password: msg.password, tabId: msg.tabId, path: msg.path }); return;
+    case "removeEmbedAuth": embedAuthMap.delete(msg.port); return;
   }
 }
 

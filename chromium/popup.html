@@ -8,22 +8,37 @@
     code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
     .endpoint { margin: 6px 0; }
     .method { font-weight: bold; color: #333; }
-    .status { color: #666; font-size: 12px; margin-top: 10px; }
+    .status-line { color: #666; font-size: 12px; margin-top: 10px; }
+    .server-item { display: flex; padding: 4px; border-bottom: 1px solid #ccc; }
+    .server-path { flex-grow: 1; font-family: monospace; }
+    .server-port { font-weight: bold; }
+    #toggle-panel {
+      display: none; margin-top: 10px; width: 100%; padding: 7px 0;
+      border: 1px solid #ccc; border-radius: 6px; background: #f8f8f8;
+      font-size: 13px; cursor: pointer; font-family: inherit;
+    }
+    #toggle-panel:hover { background: #eee; }
   </style>
 </head>
 <body>
   <h2>Tab Share</h2>
-  <div class="endpoint"><span class="method">GET</span> <code>/tabs</code> — list open tabs</div>
-  <div class="endpoint"><span class="method">GET</span> <code>/groups</code> — list tab groups</div>
-  <div class="endpoint"><span class="method">POST</span> <code>/group</code> — add tab to group</div>
-  <div class="status" id="status">Checking...</div>
-  <script>
-    fetch("http://localhost:8766/tabs").then(r => r.json()).then(d => {
-      document.getElementById("status").textContent =
-        `✓ Serving ${d.tabs?.length || 0} tabs on :8766`;
-    }).catch(() => {
-      document.getElementById("status").textContent = "✗ Native host not responding";
-    });
-  </script>
+  <div class="status-line" id="status">Checking...</div>
+
+  <section>
+    <div class="endpoint"><span class="method">GET</span> <code>/tabs</code> — list open tabs</div>
+    <div class="endpoint"><span class="method">GET</span> <code>/groups</code> — list tab groups</div>
+    <div class="endpoint"><span class="method post">POST</span> <code>/open</code> — open URL in group</div>
+
+  </section>
+
+  <button id="toggle-panel">⚡ Toggle opencode panel</button>
+
+  <section id="servers-section" style="display: none;">
+    <h4>Active opencode sessions</h4>
+    <div id="servers-list"></div>
+  </section>
+
+  <script src="popup.js"></script>
 </body>
 </html>
+

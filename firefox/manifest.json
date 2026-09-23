@@ -1,12 +1,16 @@
 {
   "manifest_version": 2,
   "name": "Tab Share",
-  "version": "2.9",
+  "version": "2.10",
   "description": "Share and manage tabs via local HTTP API",
-  "permissions": ["tabs", "tabGroups", "nativeMessaging", "contextualIdentities", "cookies", "downloads", "<all_urls>"],
+  "permissions": ["tabs", "tabGroups", "nativeMessaging", "contextualIdentities", "cookies", "downloads", "<all_urls>", "webRequest", "webRequestBlocking"],
   "browser_action": {
     "default_popup": "popup.html",
     "default_icon": "icon.svg"
+  },
+  "sidebar_action": {
+    "default_panel": "sidepanel.html",
+    "default_title": "opencode"
   },
   "background": {
     "scripts": ["background.js"]
@@ -16,5 +20,13 @@
       "id": "tab-share@local",
       "strict_min_version": "138.0"
     }
-  }
+  },
+  "content_scripts": [
+    {
+      "matches": ["file:///*", "http://127.0.0.1/*", "http://localhost/*", "https://yoavdim.github.io/*"],
+      "js": ["content.js"],
+      "all_frames": true
+    }
+  ]
 }
+
