@@ -1,8 +1,12 @@
+// Unified background script for Chromium MV3 and Firefox MV2.
+const IS_FIREFOX = browser.runtime.getManifest().manifest_version === 2;
+
+
 // Tab Share — Chromium MV3 service worker.
 // Mirrors the Firefox extension's commands (tabs/groups/open/navigate/extract/eval/group)
-// but uses the chrome.* namespace and chrome.scripting. Containers are NOT supported on
+// but uses the browser.* namespace and browser.scripting. Containers are NOT supported on
 // Chromium, so contextualIdentities / cookieStoreId handling is intentionally omitted.
-// /opencode opens the opencode web UI in the side panel (chrome.sidePanel).
+// /opencode opens the opencode web UI in the side panel (browser.sidePanel).
 
 let port = null;
 let connecting = false;
@@ -14,7 +18,7 @@ function connect() {
   if (port || connecting) return;
   connecting = true;
   try {
-    port = chrome.runtime.connectNative("tab_share");
+    port = browser.runtime.connectNative("tab_share");
   } catch (e) {
     port = null;
     connecting = false;
@@ -38,8 +42,8 @@ async function sendTabs() {
   ensurePort();
   if (!port) return;
   try {
-    const win = await chrome.windows.getCurrent();
-    const allTabs = await chrome.tabs.query({ windowId: win.id });
+    const win = await browser.windows.getCurrent();
+    const allTabs = await browser.tabs.query({ windowId: win.id });
     const activeTab = allTabs.find(t => t.active);
     // splitViewId (Chrome 137+) is shared by both panes of a split view; expose it plus
     // id/active/index so callers can find a tab's split partner without relying on order.
@@ -61,7 +65,7 @@ async function sendTabs() {
 
 async function handleGroups(msg) {
   try {
-    const groups = await chrome.tabGroups.query({});
+    const groups = await browser.tabGroups.query({});
     port.postMessage({ type: "result", id: msg.id, groups: groups.map(g => ({ id: g.id, title: g.title, color: g.color })) });
   } catch (e) {
     port.postMessage({ type: "result", id: msg.id, error: e.message });
@@ -74,24 +78,24 @@ async function handleContainers(msg) {
 }
 
 async function findOrCreateGroup(tabId, groupName, windowId) {
-  const groups = await chrome.tabGroups.query({ title: groupName, windowId });
+  const groups = await browser.tabGroups.query({ title: groupName, windowId });
   if (groups.length > 0) {
-    await chrome.tabs.group({ tabIds: [tabId], groupId: groups[0].id });
+    await browser.tabs.group({ tabIds: [tabId], groupId: groups[0].id });
     return groups[0].id;
   }
-  const groupId = await chrome.tabs.group({ tabIds: [tabId] });
-  await chrome.tabGroups.update(groupId, { title: groupName });
+  const groupId = await browser.tabs.group({ tabIds: [tabId] });
+  await browser.tabGroups.update(groupId, { title: groupName });
   return groupId;
 }
 
 async function handleOpen(msg) {
   try {
     const { url, groupName } = msg;
-    const win = await chrome.windows.getCurrent();
-    const allTabs = await chrome.tabs.query({ windowId: win.id });
+    const win = await browser.windows.getCurrent();
+    const allTabs = await browser.tabs.query({ windowId: win.id });
     let tab = allTabs.find(t => t.url === url || t.url === url + "/");
     if (!tab) {
-      tab = await chrome.tabs.create({ url, windowId: win.id });
+      tab = await browser.tabs.create({ url, windowId: win.id });
     }
     const groupId = await findOrCreateGroup(tab.id, groupName, win.id);
     port.postMessage({ type: "result", id: msg.id, ok: true, groupId, tabId: tab.id });
@@ -101,8 +105,8 @@ async function handleOpen(msg) {
 }
 
 async function resolveTab(msg) {
-  const win = await chrome.windows.getCurrent();
-  const allTabs = await chrome.tabs.query({ windowId: win.id });
+  const win = await browser.windows.getCurrent();
+  const allTabs = await browser.tabs.query({ windowId: win.id });
   if (msg.tabId) {
     const t = allTabs.find(t => t.id === msg.tabId);
     if (t) return t;
@@ -117,11 +121,11 @@ async function resolveTab(msg) {
 async function waitForLoad(tabId, timeoutMs) {
   const deadline = Date.now() + (timeoutMs || 30000);
   while (Date.now() < deadline) {
-    const t = await chrome.tabs.get(tabId);
+    const t = await browser.tabs.get(tabId);
     if (t.status === "complete") return t;
     await new Promise(r => setTimeout(r, 400));
   }
-  return chrome.tabs.get(tabId);
+  return browser.tabs.get(tabId);
 }
 
 // Injected into the page to extract text + interactive elements (MV3 func injection).
@@ -137,7 +141,7 @@ async function handleExtract(msg) {
   try {
     const tab = await resolveTab(msg);
     if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
-    const results = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extractPage });
+    const results = await browser.scripting.executeScript({ target: { tabId: tab.id }, func: extractPage });
     const data = results && results.length ? results[0].result : {};
     port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id, ...data });
   } catch (e) {
@@ -203,7 +207,7 @@ async function handleQuery(msg) {
   try {
     const tab = await resolveTab(msg);
     if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
-    const results = await chrome.scripting.executeScript({
+    const results = await browser.scripting.executeScript({
       target: { tabId: tab.id },
       func: queryElements,
       args: [msg.selector],
@@ -219,7 +223,7 @@ async function handleScroll(msg) {
   try {
     const tab = await resolveTab(msg);
     if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
-    const results = await chrome.scripting.executeScript({
+    const results = await browser.scripting.executeScript({
       target: { tabId: tab.id },
       func: scrollPage,
       args: [msg.selector || null, msg.mode || null],
@@ -247,7 +251,7 @@ async function handleEval(msg) {
   try {
     const tab = await resolveTab(msg);
     if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
-    const results = await chrome.scripting.executeScript({
+    const results = await browser.scripting.executeScript({
       target: { tabId: tab.id },
       world: "MAIN",
       func: evalInPage,
@@ -262,14 +266,14 @@ async function handleEval(msg) {
 
 async function handleNavigate(msg) {
   try {
-    const win = await chrome.windows.getCurrent();
+    const win = await browser.windows.getCurrent();
     let tab;
     if (msg.newTab) {
-      tab = await chrome.tabs.create({ url: msg.url, windowId: win.id });
+      tab = await browser.tabs.create({ url: msg.url, windowId: win.id });
     } else {
       tab = await resolveTab(msg);
       if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
-      await chrome.tabs.update(tab.id, { url: msg.url, active: true });
+      await browser.tabs.update(tab.id, { url: msg.url, active: true });
     }
     const final = await waitForLoad(tab.id, msg.timeoutMs || 30000);
     port.postMessage({ type: "result", id: msg.id, ok: true, tabId: final.id, url: final.url, title: final.title, status: final.status });
@@ -281,8 +285,8 @@ async function handleNavigate(msg) {
 async function handleGroup(msg) {
   try {
     const { tabUrl, groupName } = msg;
-    const win = await chrome.windows.getCurrent();
-    const tabs = await chrome.tabs.query({ windowId: win.id });
+    const win = await browser.windows.getCurrent();
+    const tabs = await browser.tabs.query({ windowId: win.id });
     const tab = tabs.find(t => t.url === tabUrl);
     if (!tab) {
       port.postMessage({ type: "result", id: msg.id, error: "Tab not found" });
@@ -313,11 +317,11 @@ async function handleClose(msg) {
       port.postMessage({ type: "result", id: msg.id, error: "expectGroup required (name, or null for ungrouped, or \"*\" to skip)" });
       return;
     }
-    const win = await chrome.windows.getCurrent();
-    const allTabs = await chrome.tabs.query({ windowId: win.id });
+    const win = await browser.windows.getCurrent();
+    const allTabs = await browser.tabs.query({ windowId: win.id });
 
     // resolve group titles once
-    const groups = await chrome.tabGroups.query({ windowId: win.id });
+    const groups = await browser.tabGroups.query({ windowId: win.id });
     const groupTitle = {};
     groups.forEach(g => { groupTitle[g.id] = g.title || ""; });
 
@@ -351,7 +355,7 @@ async function handleClose(msg) {
       }
       closed.push(t.id);
     }
-    if (closed.length) await chrome.tabs.remove(closed);
+    if (closed.length) await browser.tabs.remove(closed);
     port.postMessage({ type: "result", id: msg.id, ok: true, closed, rejected });
   } catch (e) {
     port.postMessage({ type: "result", id: msg.id, error: e.message });
@@ -371,7 +375,7 @@ let latestOpencodePort = null;
 async function handleOpenSidePanel(msg) {
   const logToTab = (m) => {
     if (msg.tabId) {
-      chrome.scripting.executeScript({
+      browser.scripting.executeScript({
         target: { tabId: msg.tabId },
         func: (mStr) => console.log("TabShare BG (handleOpenSidePanel):", mStr),
         args: [m]
@@ -387,14 +391,15 @@ async function handleOpenSidePanel(msg) {
     // Only call open() if we haven't opened it yet, because open() without a user
     // gesture throws an error. We must call this synchronously BEFORE any await!
     let openPromise = null;
-    if (!sidePanelOpenTabs.has(msg.tabId)) {
-      logToTab("sidePanel wasn't marked as open, calling open()...");
-      openPromise = chrome.sidePanel.open({ windowId: msg.windowId });
-      sidePanelOpenTabs.add(msg.tabId);
+    if (browser.sidePanel) {
+      logToTab("calling sidePanel.open()...");
+      openPromise = browser.sidePanel.open({ windowId: msg.windowId }).catch(e => logToTab("sidePanel.open error (expected if no gesture): " + e));
+    } else if (browser.sidebarAction) {
+      openPromise = browser.sidebarAction.open().catch(()=>{});
     }
 
     // Set options globally (no tabId) so it persists across tab switches
-    await chrome.sidePanel.setOptions({ path, enabled: true });
+    await browser.sidePanel.setOptions({ path, enabled: true });
     
     if (openPromise) {
       await openPromise;
@@ -402,7 +407,7 @@ async function handleOpenSidePanel(msg) {
     
     // Changing the query string via setOptions doesn't always trigger a reload if the 
     // panel is already open to the base HTML. We send a message to force the redirect.
-    chrome.runtime.sendMessage({ type: "redirectSidePanel", port: msg.port }).catch((e) => logToTab("sendMessage error: " + e));
+    browser.runtime.sendMessage({ type: "redirectSidePanel", port: msg.port }).catch((e) => logToTab("sendMessage error: " + e));
     
     if (msg.id) port.postMessage({ type: "result", id: msg.id, ok: true });
     logToTab("Successfully processed openSidePanel");
@@ -413,97 +418,61 @@ async function handleOpenSidePanel(msg) {
   }
 }
 
-// Track which tabs have the side panel open (best-effort; user closing via X
-// makes the state stale, but the next toggle click self-corrects).
-const sidePanelOpenTabs = new Set();
+// tracked completely locally within popup.js now.
 
 // popup.html sends getEmbeds to list active opencode sessions, and
 // toggleSidePanel to open/close the panel from the popup button.
-chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+browser.runtime.onMessage.addListener((req, sender, sendResponse) => {
   if (req.type === "getEmbeds") {
     const servers = [];
     for (const [p, entry] of embedAuthMap) {
       servers.push({ port: p, path: entry.path, tabId: entry.tabId });
     }
     sendResponse({ servers });
-  } else if (req.type === "toggleSidePanel") {
-    (async () => {
-      try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!tab) return;
-        if (sidePanelOpenTabs.has(tab.id)) {
-          // Close: disable then re-enable so it can be opened again later.
-          await chrome.sidePanel.setOptions({ tabId: tab.id, enabled: false });
-          sidePanelOpenTabs.delete(tab.id);
-          await chrome.sidePanel.setOptions({ tabId: tab.id, enabled: true });
-        } else {
-          // Open: find the first active session's port.
-          let activePort = null;
-          for (const [p] of embedAuthMap) { activePort = p; break; }
-          if (activePort) {
-            const path = `sidepanel.html?port=${activePort}`;
-            await chrome.sidePanel.setOptions({ tabId: tab.id, path, enabled: true });
-            await chrome.sidePanel.open({ tabId: tab.id });
-            sidePanelOpenTabs.add(tab.id);
-          }
-        }
-      } catch (e) {}
-    })();
+
+  } else if (req.type === "startSessionIfNone") {
+    // Internal event from popup or sidepanel
+    if (!sender.tab && embedAuthMap.size === 0) {
+      if (port) {
+        port.postMessage({ type: "startOpencode", tabId: null, windowId: null, path: undefined });
+      } else {
+        browser.runtime.sendMessage({ type: "sidePanelError", error: "Native host disconnected." }).catch(() => {});
+      }
+    }
     sendResponse({ ok: true });
   } else if (req.type === "openSidePanelFromContent") {
     // Fired from content script during a user click
-    (async () => {
-      const logToTab = (msg) => {
-         if (sender.tab && sender.tab.id) {
-           chrome.scripting.executeScript({
-             target: { tabId: sender.tab.id },
-             func: (m) => console.log("TabShare BG:", m),
-             args: [msg]
-           }).catch(()=>{});
-         }
-      };
+    const tab = sender.tab;
+    if (!tab) { sendResponse({ ok: false }); return true; }
+    
+    const isAllowed = tab.url.startsWith("file://") || 
+                      tab.url.startsWith("http://127.0.0.1") ||
+                      tab.url.startsWith("http://localhost") ||
+                      tab.url.startsWith("https://yoavdim.github.io");
+    
+    if (!isAllowed) { sendResponse({ ok: false }); return true; }
 
-      try {
-        const tab = sender.tab;
-        if (!tab) { logToTab("Error: No tab"); return; }
-        
-        const isAllowed = tab.url.startsWith("file://") || 
-                          tab.url.startsWith("http://127.0.0.1") ||
-                          tab.url.startsWith("http://localhost") ||
-                          tab.url.startsWith("https://yoavdim.github.io");
-        
-        if (!isAllowed) { logToTab("Error: Origin not allowed: " + tab.url); return; }
-
-        // Open the panel immediately (must not await anything before calling .open() 
-        // to preserve the user gesture passed from the content script)
-        chrome.sidePanel.open({ tabId: tab.id }).catch(e => logToTab("sidePanel.open error: " + e));
-        sidePanelOpenTabs.add(tab.id);
-        
-        logToTab("Opening side panel...");
-
-        if (port) {
-          logToTab("Sending startOpencode to native host...");
-          port.postMessage({ type: "startOpencode", tabId: sender.tab.id, windowId: sender.tab.windowId, path: req.path });
-        } else {
-          logToTab("Error: Native host port is disconnected!");
-        }
-      } catch (e) {
-        logToTab("Failed to open side panel from content script: " + e);
-        console.error("Failed to open side panel from content script", e);
-      }
-    })();
+    if (IS_FIREFOX) {
+      browser.sidebarAction.open().catch(e => console.error("sidebarAction.open error:", e));
+    } else {
+      browser.sidePanel.open({ windowId: tab.windowId }).catch(e => console.error("sidePanel.open error:", e));
+    }
+    
+    if (port) {
+      port.postMessage({ type: "startOpencode", tabId: sender.tab.id, windowId: sender.tab.windowId, path: req.path });
+    }
+    
     sendResponse({ ok: true });
+    return true;
   } else if (req.type === "getOpencodePort") {
     sendResponse({ port: latestOpencodePort });
-    return true;
   }
-  return true;  // keep channel open for async sendResponse
 });
 
 // Silently supply opencode's Basic Auth challenge when the request targets a known
 // /opencode port on 127.0.0.1 and originates from the tab that called /opencode.
 // The side panel does a top-level navigation so we no longer restrict to frameId !== 0.
-chrome.webRequest.onAuthRequired.addListener(
+browser.webRequest.onAuthRequired.addListener(
   (details, callback) => {
     const url = new URL(details.url);
     if (url.hostname !== "127.0.0.1") { callback({}); return; }
@@ -534,18 +503,21 @@ function handleCommand(msg) {
     case "openSidePanel": return handleOpenSidePanel(msg);
     case "injectEmbedAuth": embedAuthMap.set(msg.port, { password: msg.password, tabId: msg.tabId, path: msg.path }); return;
     case "removeEmbedAuth": embedAuthMap.delete(msg.port); return;
+    case "openSidePanelError": 
+      browser.runtime.sendMessage({ type: "sidePanelError", error: msg.error || "Failed to open side panel" }).catch(() => {});
+      return;
   }
 }
 
 // Keep tab state fresh. Service workers can be suspended, so use an alarm (min 0.5s in dev,
 // clamped by Chrome to ~30s for unpacked) plus event-driven pushes.
-chrome.runtime.onStartup.addListener(connect);
-chrome.runtime.onInstalled.addListener(connect);
-chrome.alarms.create("tab-share-poll", { periodInMinutes: 0.1 });
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === "tab-share-poll") sendTabs(); });
-chrome.tabs.onUpdated.addListener(sendTabs);
-chrome.tabs.onRemoved.addListener(sendTabs);
-chrome.tabs.onCreated.addListener(sendTabs);
-chrome.tabs.onActivated.addListener(sendTabs);
+browser.runtime.onStartup.addListener(connect);
+browser.runtime.onInstalled.addListener(connect);
+if (!IS_FIREFOX) { browser.alarms.create("tab-share-poll", { periodInMinutes: 0.1 });
+browser.alarms.onAlarm.addListener((a) => { if (a.name === "tab-share-poll") sendTabs(); }); }
+browser.tabs.onUpdated.addListener(sendTabs);
+browser.tabs.onRemoved.addListener(sendTabs);
+browser.tabs.onCreated.addListener(sendTabs);
+browser.tabs.onActivated.addListener(sendTabs);
 
 connect();

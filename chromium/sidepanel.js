@@ -12,25 +12,32 @@ function redirect(port) {
   }
 }
 
-// Check URL params first
 const params = new URLSearchParams(location.search);
 if (params.has('port')) {
   redirect(parseInt(params.get('port'), 10));
+} else {
+  // Opened directly (via popup toggle or manually). Ask to start session.
+    browser.runtime.sendMessage({ type: "startSessionIfNone" });
+  
+  // Poll until background gets the port
+  const interval = setInterval(() => {
+    browser.runtime.sendMessage({ type: "getOpencodePort" }, (response) => {
+      if (response && response.port) {
+        clearInterval(interval);
+        redirect(response.port);
+      }
+    });
+  }, 250);
 }
 
 // Also listen for messages
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === "redirectSidePanel" && msg.port) {
+browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === "pingSidePanel") {
+    sendResponse({ isOpen: true });
+  } else if (msg.type === "redirectSidePanel" && msg.port) {
     redirect(msg.port);
+  } else if (msg.type === "sidePanelError" && msg.error) {
+    const el = document.getElementById('loading');
+    if (el) el.textContent = msg.error;
   }
 });
-
-// Actively poll the background script
-const interval = setInterval(() => {
-  chrome.runtime.sendMessage({ type: "getOpencodePort" }, (response) => {
-    if (response && response.port) {
-      clearInterval(interval);
-      redirect(response.port);
-    }
-  });
-}, 200);

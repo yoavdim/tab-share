@@ -5,11 +5,8 @@ window.addEventListener("TabShare:OpenSidePanel", (e) => {
   try {
     const path = e.detail && e.detail.path ? e.detail.path : undefined;
     const msg = { type: "openSidePanelFromContent", path };
-    if (typeof chrome !== "undefined" && chrome.runtime) {
-      chrome.runtime.sendMessage(msg).catch(() => {});
-    } else if (typeof browser !== "undefined" && browser.runtime) {
-      browser.runtime.sendMessage(msg).catch(() => {});
-    }
+    browser.runtime.sendMessage(msg).catch(() => {});
+    window.dispatchEvent(new CustomEvent("TabShare:SidePanelBlocked", { detail: { message: "Please click the extension icon." } }));
   } catch (err) {
     console.error("TabShare: Failed to send message to background", err);
   }

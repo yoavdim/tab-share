@@ -1,23 +1,60 @@
+// Unified background script for Chromium MV3 and Firefox MV2.
+const IS_FIREFOX = browser.runtime.getManifest().manifest_version === 2;
+
+
+// Tab Share — Chromium MV3 service worker.
+// Mirrors the Firefox extension's commands (tabs/groups/open/navigate/extract/eval/group)
+// but uses the browser.* namespace and browser.scripting. Containers are NOT supported on
+// Chromium, so contextualIdentities / cookieStoreId handling is intentionally omitted.
+// /opencode opens the opencode web UI in the side panel (browser.sidePanel).
+
 let port = null;
+let connecting = false;
 
 function connect() {
-  port = browser.runtime.connectNative("tab_share");
+  // Guard against the MV3 connection storm: never open a second native port.
+  // A live native-messaging port also keeps the service worker alive, which is
+  // exactly what we want, so we hold a single connection for the SW's lifetime.
+  if (port || connecting) return;
+  connecting = true;
+  try {
+    port = browser.runtime.connectNative("tab_share");
+  } catch (e) {
+    port = null;
+    connecting = false;
+    return;
+  }
+  connecting = false;
   port.onDisconnect.addListener(() => {
     port = null;
+    // Reconnect only if we're not already mid-connect; small delay avoids a tight loop.
     setTimeout(connect, 3000);
   });
   port.onMessage.addListener(handleCommand);
+  sendTabs();
+}
+
+function ensurePort() {
+  if (!port) connect();
 }
 
 async function sendTabs() {
+  ensurePort();
   if (!port) return;
   try {
     const win = await browser.windows.getCurrent();
     const allTabs = await browser.tabs.query({ windowId: win.id });
     const activeTab = allTabs.find(t => t.active);
-
-    // expose id/active/index so callers (e.g. /close by tabId) can target tabs reliably.
-    const shape = t => ({ id: t.id, title: t.title, url: t.url, active: !!t.active, index: t.index });
+    // splitViewId (Chrome 137+) is shared by both panes of a split view; expose it plus
+    // id/active/index so callers can find a tab's split partner without relying on order.
+    const shape = t => ({
+      id: t.id,
+      title: t.title,
+      url: t.url,
+      active: !!t.active,
+      index: t.index,
+      splitViewId: (t.splitViewId !== undefined ? t.splitViewId : null),
+    });
     port.postMessage({
       type: "tabs",
       activeTab: activeTab ? shape(activeTab) : null,
@@ -35,51 +72,38 @@ async function handleGroups(msg) {
   }
 }
 
+// Chromium has no Multi-Account Containers — report an empty list so callers degrade gracefully.
+async function handleContainers(msg) {
+  port.postMessage({ type: "result", id: msg.id, containers: [], note: "containers unsupported on Chromium" });
+}
+
+async function findOrCreateGroup(tabId, groupName, windowId) {
+  const groups = await browser.tabGroups.query({ title: groupName, windowId });
+  if (groups.length > 0) {
+    await browser.tabs.group({ tabIds: [tabId], groupId: groups[0].id });
+    return groups[0].id;
+  }
+  const groupId = await browser.tabs.group({ tabIds: [tabId] });
+  await browser.tabGroups.update(groupId, { title: groupName });
+  return groupId;
+}
+
 async function handleOpen(msg) {
   try {
-    const { url, groupName, cookieStoreId: requestedStoreId } = msg;
+    const { url, groupName } = msg;
     const win = await browser.windows.getCurrent();
-
-    // Check if a tab with this URL already exists — move it instead of opening a duplicate
     const allTabs = await browser.tabs.query({ windowId: win.id });
     let tab = allTabs.find(t => t.url === url || t.url === url + "/");
     if (!tab) {
-      const opts = { url, windowId: win.id };
-      if (requestedStoreId) opts.cookieStoreId = requestedStoreId;
-      tab = await browser.tabs.create(opts);
+      tab = await browser.tabs.create({ url, windowId: win.id });
     }
-
-    // Find or create group
-    const groups = await browser.tabGroups.query({ title: groupName, windowId: win.id });
-    let groupId;
-    if (groups.length > 0) {
-      groupId = groups[0].id;
-      await browser.tabs.group({ tabIds: [tab.id], groupId });
-    } else {
-      groupId = await browser.tabs.group({ tabIds: [tab.id] });
-      await browser.tabGroups.update(groupId, { title: groupName });
-    }
-
-    if (port && msg.path) {
-      port.postMessage({ type: "startOpencode", tabId: tab.id, path: msg.path });
-    }
-
+    const groupId = await findOrCreateGroup(tab.id, groupName, win.id);
     port.postMessage({ type: "result", id: msg.id, ok: true, groupId, tabId: tab.id });
   } catch (e) {
     port.postMessage({ type: "result", id: msg.id, error: e.message });
   }
 }
 
-async function handleContainers(msg) {
-  try {
-    const containers = await browser.contextualIdentities.query({});
-    port.postMessage({ type: "result", id: msg.id, containers: containers.map(c => ({ name: c.name, cookieStoreId: c.cookieStoreId, color: c.color })) });
-  } catch (e) {
-    port.postMessage({ type: "result", id: msg.id, error: e.message });
-  }
-}
-
-// Resolve a target tab from msg: prefer tabId, then exact url match, else active tab.
 async function resolveTab(msg) {
   const win = await browser.windows.getCurrent();
   const allTabs = await browser.tabs.query({ windowId: win.id });
@@ -94,7 +118,6 @@ async function resolveTab(msg) {
   return allTabs.find(t => t.active);
 }
 
-// Wait until a tab finishes loading (status === "complete"), up to timeoutMs.
 async function waitForLoad(tabId, timeoutMs) {
   const deadline = Date.now() + (timeoutMs || 30000);
   while (Date.now() < deadline) {
@@ -105,19 +128,31 @@ async function waitForLoad(tabId, timeoutMs) {
   return browser.tabs.get(tabId);
 }
 
-async function handleEval(msg) {
+// Injected into the page to extract text + interactive elements (MV3 func injection).
+function extractPage() {
+  const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+  const links = [...document.querySelectorAll('a[href]')].filter(vis).map(a => ({ text: (a.innerText || '').trim().slice(0, 100), href: a.href })).filter(x => x.text || x.href).slice(0, 200);
+  const buttons = [...document.querySelectorAll('button, [role=button], input[type=submit], input[type=button]')].filter(vis).map(b => ({ text: (b.innerText || b.value || b.getAttribute('aria-label') || '').trim().slice(0, 100) })).filter(x => x.text).slice(0, 100);
+  const inputs = [...document.querySelectorAll('input, select, textarea')].filter(vis).map(i => ({ name: i.name || '', id: i.id || '', type: i.type || i.tagName.toLowerCase(), placeholder: i.placeholder || '' })).slice(0, 100);
+  return { url: location.href, title: document.title, text: (document.body ? document.body.innerText : '').slice(0, 20000), links, buttons, inputs };
+}
+
+async function handleExtract(msg) {
   try {
     const tab = await resolveTab(msg);
     if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
-    const results = await browser.tabs.executeScript(tab.id, { code: msg.code });
-    port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id, url: tab.url, result: results && results.length === 1 ? results[0] : results });
+    const results = await browser.scripting.executeScript({ target: { tabId: tab.id }, func: extractPage });
+    const data = results && results.length ? results[0].result : {};
+    port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id, ...data });
   } catch (e) {
     port.postMessage({ type: "result", id: msg.id, error: e.message });
   }
 }
 
-// CSP-safe alternative to /eval: runs the extension's own DOM code, not a caller string.
-// Keep in sync with chromium/background.js.
+// ---- CSP-safe DOM access (/query, /scroll) ---------------------------------
+
+// CSP-safe alternative to /eval: runs in the extension's isolated world.
+// Keep in sync with firefox/background.js.
 function queryElements(selector) {
   let els;
   try {
@@ -168,23 +203,16 @@ function scrollPage(selector, mode) {
   }
 }
 
-// Serialize a page op for MV2's `code:` API. Args are JSON-encoded, so a selector
-// containing quotes cannot break out of the source.
-function pageOpSource(fn, args) {
-  const encoded = (args || [])
-    .map(a => JSON.stringify(a === undefined ? null : a))
-    .join(",");
-  return "(" + fn.toString() + ")(" + encoded + ")";
-}
-
 async function handleQuery(msg) {
   try {
     const tab = await resolveTab(msg);
     if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
-    const results = await browser.tabs.executeScript(tab.id, {
-      code: pageOpSource(queryElements, [msg.selector]),
+    const results = await browser.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: queryElements,
+      args: [msg.selector],
     });
-    const out = results && results.length ? results[0] : null;
+    const out = results && results.length ? results[0].result : null;
     port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id, url: tab.url, result: out });
   } catch (e) {
     port.postMessage({ type: "result", id: msg.id, error: e.message });
@@ -195,10 +223,41 @@ async function handleScroll(msg) {
   try {
     const tab = await resolveTab(msg);
     if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
-    const results = await browser.tabs.executeScript(tab.id, {
-      code: pageOpSource(scrollPage, [msg.selector || null, msg.mode || null]),
+    const results = await browser.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: scrollPage,
+      args: [msg.selector || null, msg.mode || null],
     });
-    const out = results && results.length ? results[0] : null;
+    const out = results && results.length ? results[0].result : null;
+    port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id, url: tab.url, result: out });
+  } catch (e) {
+    port.postMessage({ type: "result", id: msg.id, error: e.message });
+  }
+}
+
+// MV3 cannot inject arbitrary code strings. We wrap the requested code in a function
+// that evals it in the page world. This requires the page CSP to allow it; on strict-CSP
+// pages /eval may fail — prefer /extract for content scraping.
+function evalInPage(code) {
+  try {
+    // eslint-disable-next-line no-eval
+    return { ok: true, value: (0, eval)(code) };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+async function handleEval(msg) {
+  try {
+    const tab = await resolveTab(msg);
+    if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
+    const results = await browser.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "MAIN",
+      func: evalInPage,
+      args: [msg.code],
+    });
+    const out = results && results.length ? results[0].result : null;
     port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id, url: tab.url, result: out });
   } catch (e) {
     port.postMessage({ type: "result", id: msg.id, error: e.message });
@@ -210,9 +269,7 @@ async function handleNavigate(msg) {
     const win = await browser.windows.getCurrent();
     let tab;
     if (msg.newTab) {
-      const opts = { url: msg.url, windowId: win.id };
-      if (msg.cookieStoreId) opts.cookieStoreId = msg.cookieStoreId;
-      tab = await browser.tabs.create(opts);
+      tab = await browser.tabs.create({ url: msg.url, windowId: win.id });
     } else {
       tab = await resolveTab(msg);
       if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
@@ -225,34 +282,29 @@ async function handleNavigate(msg) {
   }
 }
 
-// Extract page text + interactive elements via a content script.
-const EXTRACT_CODE = `(() => {
-  const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
-  const links = [...document.querySelectorAll('a[href]')].filter(vis).map(a => ({ text: (a.innerText||'').trim().slice(0,100), href: a.href })).filter(x => x.text || x.href).slice(0, 200);
-  const buttons = [...document.querySelectorAll('button, [role=button], input[type=submit], input[type=button]')].filter(vis).map(b => ({ text: (b.innerText||b.value||b.getAttribute('aria-label')||'').trim().slice(0,100) })).filter(x => x.text).slice(0, 100);
-  const inputs = [...document.querySelectorAll('input, select, textarea')].filter(vis).map(i => ({ name: i.name||'', id: i.id||'', type: i.type||i.tagName.toLowerCase(), placeholder: i.placeholder||'' })).slice(0, 100);
-  return { url: location.href, title: document.title, text: (document.body ? document.body.innerText : '').slice(0, 20000), links, buttons, inputs };
-})()`;
-
-async function handleExtract(msg) {
+async function handleGroup(msg) {
   try {
-    const tab = await resolveTab(msg);
-    if (!tab) { port.postMessage({ type: "result", id: msg.id, error: "No target tab" }); return; }
-    const results = await browser.tabs.executeScript(tab.id, { code: EXTRACT_CODE });
-    const data = results && results.length ? results[0] : {};
-    port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id, ...data });
+    const { tabUrl, groupName } = msg;
+    const win = await browser.windows.getCurrent();
+    const tabs = await browser.tabs.query({ windowId: win.id });
+    const tab = tabs.find(t => t.url === tabUrl);
+    if (!tab) {
+      port.postMessage({ type: "result", id: msg.id, error: "Tab not found" });
+      return;
+    }
+    const groupId = await findOrCreateGroup(tab.id, groupName, win.id);
+    port.postMessage({ type: "result", id: msg.id, ok: true, groupId });
   } catch (e) {
     port.postMessage({ type: "result", id: msg.id, error: e.message });
   }
 }
 
 // Close tabs — SAFETY-GATED. A tab is closed only if it matches ALL of:
-//   - selector: tabId(s) and/or url(s); OR a concrete expectGroup (name) closes the
-//     whole group,
-//   - expectHost: the tab URL's hostname must equal this — REQUIRED,
-//   - expectGroup: the tab's group title must equal this; null/"" => require UNGROUPED,
-//     "*" => skip the group check — REQUIRED.
-// Mirrors the Chromium handler so callers behave identically across browsers.
+//   - selector: tabId(s) and/or url(s) (at least one required),
+//   - expectHost: the tab URL's hostname must equal this (the "DNS part") — REQUIRED,
+//   - expectGroup: the tab's group title must equal this; pass null/"" to require the tab
+//     be UNGROUPED — REQUIRED (use the sentinel "*" to explicitly skip the group check).
+// This prevents closing the wrong tab when a tabId is stale/reused or a URL matched broadly.
 function hostOf(u) { try { return new URL(u).hostname; } catch (e) { return null; } }
 
 async function handleClose(msg) {
@@ -268,13 +320,14 @@ async function handleClose(msg) {
     const win = await browser.windows.getCurrent();
     const allTabs = await browser.tabs.query({ windowId: win.id });
 
-    // resolve group titles once (tabGroups may be unavailable on older Firefox)
+    // resolve group titles once
+    const groups = await browser.tabGroups.query({ windowId: win.id });
     const groupTitle = {};
-    try {
-      const groups = await browser.tabGroups.query({ windowId: win.id });
-      groups.forEach(g => { groupTitle[g.id] = g.title || ""; });
-    } catch (e) {}
+    groups.forEach(g => { groupTitle[g.id] = g.title || ""; });
 
+    // 1) candidate selection by tabId and/or url. As a special case, a concrete
+    // expectGroup (not "*") with NO tabId/url selects every tab in that group — the
+    // "close the whole Scratch group" flow. (Still host-gated below.)
     const ids = msg.tabId != null ? (Array.isArray(msg.tabId) ? msg.tabId : [msg.tabId]) : null;
     const urls = msg.url != null ? (Array.isArray(msg.url) ? msg.url : [msg.url]) : null;
     const skipGroup = msg.expectGroup === "*";
@@ -291,9 +344,9 @@ async function handleClose(msg) {
                        (urls && urls.some(u => t.url === u || t.url === u + "/" ||
                                                (msg.prefix && t.url && t.url.startsWith(u))));
       if (!selected) continue;
-      // SAFETY: host must match
+      // 2) SAFETY: host must match
       if (hostOf(t.url) !== msg.expectHost) { rejected.push({ id: t.id, why: "host-mismatch", host: hostOf(t.url) }); continue; }
-      // SAFETY: group must match (null/"" => ungrouped; "*" => skip)
+      // 3) SAFETY: group must match (null/"" => ungrouped; "*" => skip)
       if (!skipGroup) {
         const gid = (t.groupId != null && t.groupId !== -1) ? t.groupId : null;
         const title = gid == null ? null : (groupTitle[gid] || "");
@@ -309,48 +362,162 @@ async function handleClose(msg) {
   }
 }
 
-async function handleCommand(msg) {
-  if (!port) return;
-  if (msg.type === "groups") return handleGroups(msg);
-  if (msg.type === "open") return handleOpen(msg);
-  if (msg.type === "containers") return handleContainers(msg);
-  if (msg.type === "eval") return handleEval(msg);
-  if (msg.type === "query") return handleQuery(msg);
-  if (msg.type === "scroll") return handleScroll(msg);
-  if (msg.type === "navigate") return handleNavigate(msg);
-  if (msg.type === "extract") return handleExtract(msg);
-  if (msg.type === "close") return handleClose(msg);
-  if (msg.type !== "group") return;
+// Per-port auth map for /opencode servers. Keyed by port number, value is {password, tabId}.
+// Passwords flow here from native_host via native messaging only — never via the web page.
+// The webRequest.onAuthRequired listener below uses this map.
+const embedAuthMap = new Map(); // port (number) -> {password, tabId}
+
+// We store the latest port here temporarily to handle the race condition
+// where the Python script responds before sidepanel.html finishes loading.
+let latestOpencodePort = null;
+
+// Open the opencode side panel for the requesting tab.
+async function handleOpenSidePanel(msg) {
+  const logToTab = (m) => {
+    if (msg.tabId) {
+      browser.scripting.executeScript({
+        target: { tabId: msg.tabId },
+        func: (mStr) => console.log("TabShare BG (handleOpenSidePanel):", mStr),
+        args: [m]
+      }).catch(()=>{});
+    }
+  };
+
   try {
-    const { tabUrl, groupName } = msg;
-    const win = await browser.windows.getCurrent();
-    const tabs = await browser.tabs.query({ windowId: win.id, url: undefined });
-    const tab = tabs.find(t => t.url === tabUrl);
-    if (!tab) {
-      port.postMessage({ type: "result", id: msg.id, error: "Tab not found" });
-      return;
+    logToTab("Received openSidePanel from native host, port=" + msg.port);
+    latestOpencodePort = msg.port;
+    const path = `sidepanel.html?port=${msg.port}`;
+    
+    // Only call open() if we haven't opened it yet, because open() without a user
+    // gesture throws an error. We must call this synchronously BEFORE any await!
+    let openPromise = null;
+    if (browser.sidePanel) {
+      logToTab("calling sidePanel.open()...");
+      openPromise = browser.sidePanel.open({ windowId: msg.windowId }).catch(e => logToTab("sidePanel.open error (expected if no gesture): " + e));
+    } else if (browser.sidebarAction) {
+      openPromise = browser.sidebarAction.open().catch(()=>{});
     }
 
-    // Find existing group by name
-    const groups = await browser.tabGroups.query({ title: groupName, windowId: win.id });
-    let groupId;
-    if (groups.length > 0) {
-      groupId = groups[0].id;
-      await browser.tabs.group({ tabIds: [tab.id], groupId });
-    } else {
-      groupId = await browser.tabs.group({ tabIds: [tab.id] });
-      await browser.tabGroups.update(groupId, { title: groupName });
+    // Set options globally (no tabId) so it persists across tab switches
+    await browser.sidePanel.setOptions({ path, enabled: true });
+    
+    if (openPromise) {
+      await openPromise;
     }
-
-    port.postMessage({ type: "result", id: msg.id, ok: true, groupId });
+    
+    // Changing the query string via setOptions doesn't always trigger a reload if the 
+    // panel is already open to the base HTML. We send a message to force the redirect.
+    browser.runtime.sendMessage({ type: "redirectSidePanel", port: msg.port }).catch((e) => logToTab("sendMessage error: " + e));
+    
+    if (msg.id) port.postMessage({ type: "result", id: msg.id, ok: true });
+    logToTab("Successfully processed openSidePanel");
   } catch (e) {
-    port.postMessage({ type: "result", id: msg.id, error: e.message });
+    logToTab("handleOpenSidePanel error: " + e);
+    console.error("handleOpenSidePanel error:", e);
+    if (msg.id) port.postMessage({ type: "result", id: msg.id, error: e.message });
   }
 }
 
-connect();
-setInterval(sendTabs, 2000);
+// tracked completely locally within popup.js now.
+
+// popup.html sends getEmbeds to list active opencode sessions, and
+// toggleSidePanel to open/close the panel from the popup button.
+browser.runtime.onMessage.addListener((req, sender, sendResponse) => {
+  if (req.type === "getEmbeds") {
+    const servers = [];
+    for (const [p, entry] of embedAuthMap) {
+      servers.push({ port: p, path: entry.path, tabId: entry.tabId });
+    }
+    sendResponse({ servers });
+
+  } else if (req.type === "startSessionIfNone") {
+    // Internal event from popup or sidepanel
+    if (!sender.tab && embedAuthMap.size === 0) {
+      if (port) {
+        port.postMessage({ type: "startOpencode", tabId: null, windowId: null, path: undefined });
+      } else {
+        browser.runtime.sendMessage({ type: "sidePanelError", error: "Native host disconnected." }).catch(() => {});
+      }
+    }
+    sendResponse({ ok: true });
+  } else if (req.type === "openSidePanelFromContent") {
+    // Fired from content script during a user click
+    const tab = sender.tab;
+    if (!tab) { sendResponse({ ok: false }); return true; }
+    
+    const isAllowed = tab.url.startsWith("file://") || 
+                      tab.url.startsWith("http://127.0.0.1") ||
+                      tab.url.startsWith("http://localhost") ||
+                      tab.url.startsWith("https://yoavdim.github.io");
+    
+    if (!isAllowed) { sendResponse({ ok: false }); return true; }
+
+    if (IS_FIREFOX) {
+      browser.sidebarAction.open().catch(e => console.error("sidebarAction.open error:", e));
+    } else {
+      browser.sidePanel.open({ windowId: tab.windowId }).catch(e => console.error("sidePanel.open error:", e));
+    }
+    
+    if (port) {
+      port.postMessage({ type: "startOpencode", tabId: sender.tab.id, windowId: sender.tab.windowId, path: req.path });
+    }
+    
+    sendResponse({ ok: true });
+    return true;
+  } else if (req.type === "getOpencodePort") {
+    sendResponse({ port: latestOpencodePort });
+  }
+});
+
+// Silently supply opencode's Basic Auth challenge when the request targets a known
+// /opencode port on 127.0.0.1 and originates from the tab that called /opencode.
+// The side panel does a top-level navigation so we no longer restrict to frameId !== 0.
+browser.webRequest.onAuthRequired.addListener(
+  (details, callback) => {
+    const url = new URL(details.url);
+    if (url.hostname !== "127.0.0.1") { callback({}); return; }
+    const entry = embedAuthMap.get(parseInt(url.port, 10));
+    if (entry && (details.tabId === entry.tabId || details.tabId === -1)) {
+      callback({ authCredentials: { username: "opencode", password: entry.password } });
+    } else {
+      callback({});
+    }
+  },
+  { urls: ["http://127.0.0.1/*", "ws://127.0.0.1/*", "wss://127.0.0.1/*"] },
+  ["asyncBlocking"]
+);
+
+function handleCommand(msg) {
+  if (!port) return;
+  switch (msg.type) {
+    case "groups": return handleGroups(msg);
+    case "open": return handleOpen(msg);
+    case "containers": return handleContainers(msg);
+    case "eval": return handleEval(msg);
+    case "query": return handleQuery(msg);
+    case "scroll": return handleScroll(msg);
+    case "navigate": return handleNavigate(msg);
+    case "extract": return handleExtract(msg);
+    case "group": return handleGroup(msg);
+    case "close": return handleClose(msg);
+    case "openSidePanel": return handleOpenSidePanel(msg);
+    case "injectEmbedAuth": embedAuthMap.set(msg.port, { password: msg.password, tabId: msg.tabId, path: msg.path }); return;
+    case "removeEmbedAuth": embedAuthMap.delete(msg.port); return;
+    case "openSidePanelError": 
+      browser.runtime.sendMessage({ type: "sidePanelError", error: msg.error || "Failed to open side panel" }).catch(() => {});
+      return;
+  }
+}
+
+// Keep tab state fresh. Service workers can be suspended, so use an alarm (min 0.5s in dev,
+// clamped by Chrome to ~30s for unpacked) plus event-driven pushes.
+browser.runtime.onStartup.addListener(connect);
+browser.runtime.onInstalled.addListener(connect);
+if (!IS_FIREFOX) { browser.alarms.create("tab-share-poll", { periodInMinutes: 0.1 });
+browser.alarms.onAlarm.addListener((a) => { if (a.name === "tab-share-poll") sendTabs(); }); }
 browser.tabs.onUpdated.addListener(sendTabs);
 browser.tabs.onRemoved.addListener(sendTabs);
 browser.tabs.onCreated.addListener(sendTabs);
 browser.tabs.onActivated.addListener(sendTabs);
+
+connect();

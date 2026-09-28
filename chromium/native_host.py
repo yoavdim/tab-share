@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Native messaging host for Tab Share. Caches tabs pushed from the extension
-and serves them over HTTP on port 8766. Also relays commands back to the extension."""
+and serves them over HTTP. Also relays commands back to the extension."""
 
 import atexit
 import json
@@ -16,12 +16,36 @@ import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 state = {"data": "{}"}
+
+# ---- opencode binary resolution -------------------------------------------
+def _find_opencode() -> str:
+    import shutil
+    found = shutil.which("opencode")
+    if found: return found
+    home = os.path.expanduser("~")
+    for c in [
+        os.path.join(home, ".opencode", "bin", "opencode"),
+        os.path.join(home, ".local", "bin", "opencode"),
+        os.path.join(home, "bin", "opencode"),
+        "/usr/local/bin/opencode",
+        "/usr/bin/opencode",
+    ]:
+        if os.path.isfile(c) and os.access(c, os.X_OK): return c
+    return "opencode"
+
+_OPENCODE_BIN = _find_opencode()
+_OPENCODE_FOUND = os.path.isfile(_OPENCODE_BIN) and os.access(_OPENCODE_BIN, os.X_OK)
+
 lock = threading.Lock()
 pending = {}  # id -> threading.Event, result
 pending_lock = threading.Lock()
 write_lock = threading.Lock()
 
-PORT = 8766
+# Detect browser based on argv[1]
+# Chrome passes origin: chrome-extension://...
+# Firefox passes path to the manifest JSON
+is_chrome = len(sys.argv) > 1 and sys.argv[1].startswith("chrome-extension://")
+PORT = 8766 if is_chrome else 8765
 
 # ---- CORS policy ----------------------------------------------------------
 # Localhost origins may reach every endpoint. The file:// interface (tracker.html
@@ -150,7 +174,7 @@ def _start_embed_server(real_path):
         # Open a log file for opencode serve so we can debug
         log_file = open(os.path.expanduser("~/.opencode_serve.log"), "a")
         proc = subprocess.Popen(
-            ["opencode", "serve", "--port", str(port), "--hostname", "127.0.0.1"],
+            [_OPENCODE_BIN, "serve", "--port", str(port), "--hostname", "127.0.0.1"],
             cwd=real_path, env=env,
             stdout=log_file, stderr=subprocess.STDOUT,
         )
@@ -615,10 +639,10 @@ if __name__ == "__main__":
     # the port. If a stale host (whose SW has died) holds it, take it over. The live SW's
     # open native-messaging port then keeps that SW alive so live commands don't time out.
     httpd = _bind_newest_wins()
-    if httpd is None:
-        sys.exit(0)
-
-    threading.Thread(target=run_server, args=(httpd,), daemon=True).start()
+    if httpd is not None:
+        threading.Thread(target=run_server, args=(httpd,), daemon=True).start()
+    else:
+        pass
     threading.Thread(target=keepalive_pinger, daemon=True).start()
     threading.Thread(target=_reap_embed_servers, daemon=True).start()
 
@@ -644,6 +668,17 @@ if __name__ == "__main__":
             def _start_opencode(d):
                 tab_id = d.get("tabId")
                 window_id = d.get("windowId")
+                
+                # Check for Chromium snap
+                snap_name = os.environ.get("SNAP_NAME", "")
+                if snap_name and "chromium" in snap_name.lower():
+                    send_message({"type": "openSidePanelError", "tabId": tab_id, "error": "The opencode side panel is not supported on Chromium snap. Please use the non-snap Chromium or Chrome package."})
+                    return
+                
+                if not _OPENCODE_FOUND:
+                    send_message({"type": "openSidePanelError", "tabId": tab_id, "error": "opencode is not installed or not found in PATH. Install it from https://opencode.ai and restart your browser."})
+                    return
+
                 path = d.get("path")
                 real = _HOME
                 if path:

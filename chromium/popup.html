@@ -13,7 +13,7 @@
     .server-path { flex-grow: 1; font-family: monospace; }
     .server-port { font-weight: bold; }
     #toggle-panel {
-      display: none; margin-top: 10px; width: 100%; padding: 7px 0;
+      margin-top: 10px; width: 100%; padding: 7px 0;
       border: 1px solid #ccc; border-radius: 6px; background: #f8f8f8;
       font-size: 13px; cursor: pointer; font-family: inherit;
     }
@@ -23,12 +23,9 @@
 <body>
   <h2>Tab Share</h2>
   <div class="status-line" id="status">Checking...</div>
-
+  
   <section>
     <div class="endpoint"><span class="method">GET</span> <code>/tabs</code> — list open tabs</div>
-    <div class="endpoint"><span class="method">GET</span> <code>/groups</code> — list tab groups</div>
-    <div class="endpoint"><span class="method post">POST</span> <code>/open</code> — open URL in group</div>
-
   </section>
 
   <button id="toggle-panel">⚡ Toggle opencode panel</button>

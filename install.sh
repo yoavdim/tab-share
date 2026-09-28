@@ -124,36 +124,40 @@ install_firefox() {
         echo "   (Snap Firefox detected, staging files for snap access...)"
         
         # Snap setup
-        mkdir -p "$HOME/.local/lib/tab_share"
-        cp "$TS_DIR/firefox/native_host.py" "$HOME/.local/lib/tab_share/native_host.py"
-        chmod +x "$HOME/.local/lib/tab_share/native_host.py"
+        # Place the python executable inside the snap common dir so Firefox has read/execute permission
+        cp "$TS_DIR/firefox/native_host.py" "$HOME/snap/firefox/common/native_host.py"
+        chmod +x "$HOME/snap/firefox/common/native_host.py"
         
-        mkdir -p "$HOME/.mozilla/native-messaging-hosts"
+        # Snap Firefox reads native messaging hosts from its own common dir,
+        # NOT from ~/.mozilla/native-messaging-hosts.
+        NMH_DIR="$HOME/snap/firefox/common/.mozilla/native-messaging-hosts"
+        mkdir -p "$NMH_DIR"
         python3 - <<'PY'
 import json, os
 ts_dir = os.environ.get('TS_DIR', '.')
 src = os.path.join(ts_dir, 'firefox', 'tab_share.json')
-dst = os.path.expanduser('~/.mozilla/native-messaging-hosts/tab_share.json')
+dst = os.path.expanduser('~/snap/firefox/common/.mozilla/native-messaging-hosts/tab_share.json')
 m = json.load(open(src))
-m['path'] = os.path.expanduser('~/.local/lib/tab_share/native_host.py')
+m['path'] = os.path.expanduser('~/snap/firefox/common/native_host.py')
 json.dump(m, open(dst, 'w'), indent=2)
 PY
         
         mkdir -p "$HOME/snap/firefox/common/tab_share_extension"
         cp -r "$TS_DIR/firefox/"* "$HOME/snap/firefox/common/tab_share_extension/"
-        
-        echo "1. Open about:debugging#/runtime/this-firefox in Firefox"
-        echo "2. Click 'Load Temporary Add-on'"
+    fi
+
+    # Standard setup
+    MANIFEST_DIR="$HOME/.mozilla/native-messaging-hosts"
+    mkdir -p "$MANIFEST_DIR"
+    jq --arg path "$TS_DIR/firefox/native_host.py" '.path = $path' \
+      "$TS_DIR/firefox/tab_share.json" > "$MANIFEST_DIR/tab_share.json"
+    
+    echo "1. Open about:debugging#/runtime/this-firefox in Firefox"
+    echo "2. Click 'Load Temporary Add-on'"
+    
+    if [ -d "$HOME/snap/firefox" ]; then
         echo "3. Select: $HOME/snap/firefox/common/tab_share_extension/manifest.json"
     else
-        # Standard setup
-        MANIFEST_DIR="$HOME/.mozilla/native-messaging-hosts"
-        mkdir -p "$MANIFEST_DIR"
-        jq --arg path "$TS_DIR/firefox/native_host.py" '.path = $path' \
-          "$TS_DIR/firefox/tab_share.json" > "$MANIFEST_DIR/tab_share.json"
-        
-        echo "1. Open about:debugging#/runtime/this-firefox in Firefox"
-        echo "2. Click 'Load Temporary Add-on'"
         echo "3. Select: $TS_DIR/firefox/manifest.json"
     fi
     echo ""
