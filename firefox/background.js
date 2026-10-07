@@ -466,6 +466,15 @@ browser.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return true;
   } else if (req.type === "getOpencodePort") {
     sendResponse({ port: latestOpencodePort });
+  } else if (req.type === "getTimerTabs") {
+    handleGetTimerTabs(req).then(timerTabs => sendResponse({ timerTabs }));
+    return true;
+  } else if (req.type === "createTimerTab") {
+    handleCreateTimerTab(req).then(res => sendResponse(res));
+    return true;
+  } else if (req.type === "timerAction") {
+    handleTimerAction(req).then(res => sendResponse(res));
+    return true;
   }
 });
 
@@ -487,6 +496,143 @@ browser.webRequest.onAuthRequired.addListener(
   ["asyncBlocking"]
 );
 
+// ---- TabTimer integration ----
+
+const TIMER_URL_PREFIX = "https://yoavdim.github.io/TabTimer";
+const timerCallerMap = new Map(); // Maps X-Tab-Url -> tabId
+
+function isTimerUrl(url) {
+  if (!url) return false;
+  // Match /TabTimer, /TabTimer/, /TabTimer?..., /TabTimer/index.html etc.
+  if (!url.startsWith(TIMER_URL_PREFIX)) return false;
+  const rest = url.slice(TIMER_URL_PREFIX.length);
+  return rest === "" || rest[0] === "/" || rest[0] === "?" || rest[0] === "#";
+}
+
+async function handleGetTimerTabs(msg) {
+  try {
+    const win = await browser.windows.getCurrent();
+    const allTabs = await browser.tabs.query({ windowId: win.id });
+    const timerTabs = allTabs.filter(t => isTimerUrl(t.url));
+
+    const includeLog = !!(msg && msg.include_log);
+
+    const results = await Promise.all(timerTabs.map(async (t) => {
+      let state = null;
+      try {
+        state = await Promise.race([
+          browser.tabs.sendMessage(t.id, { type: "GET_TIMER_STATE", include_log: includeLog }),
+          new Promise(r => setTimeout(() => r(null), 800)),
+        ]);
+      } catch (e) { /* content script not ready yet */ }
+      const entry = {
+        tabId: t.id,
+        direction: state ? state.direction : "up",
+        value: state ? state.value : "--:--",
+        rawValue: state ? state.rawValue : 0,
+        isRunning: state ? !!state.isRunning : false,
+      };
+      if (includeLog && state && state.log) entry.log = state.log;
+      return entry;
+    }));
+
+    if (msg && msg.id && port) {
+      port.postMessage({ type: "result", id: msg.id, ok: true, timerTabs: results });
+    }
+    return results;
+  } catch (e) {
+    if (msg && msg.id && port) port.postMessage({ type: "result", id: msg.id, error: e.message });
+    return [];
+  }
+}
+
+async function handleCreateTimerTab(msg) {
+  try {
+    const win = await browser.windows.getCurrent();
+    const allTabs = await browser.tabs.query({ windowId: win.id });
+
+    if (msg.xTabUrl) {
+      const existingId = timerCallerMap.get(msg.xTabUrl);
+      if (existingId != null) {
+        const existingTab = allTabs.find(t => t.id === existingId);
+        if (existingTab && isTimerUrl(existingTab.url)) {
+          if (msg && msg.id && port) {
+            port.postMessage({ type: "result", id: msg.id, ok: true, tabId: existingTab.id, reused: true });
+          }
+          return { ok: true, tabId: existingTab.id, reused: true };
+        }
+      }
+    }
+
+    const value = msg.value;
+    const direction = msg.direction || "up";
+    let targetUrl = TIMER_URL_PREFIX + "/";
+
+    if (direction === "up" && (!value || value === "0" || value === "stoper")) {
+      targetUrl += "?val=stoper";
+    } else if (value) {
+      const dirParam = direction === "down" ? "down" : "up";
+      targetUrl += "?val=" + encodeURIComponent(value) + "&dir=" + dirParam;
+    } else {
+      targetUrl += "?val=stoper";
+    }
+
+    const tab = await browser.tabs.create({ url: targetUrl, windowId: win.id });
+    if (msg.xTabUrl) {
+      timerCallerMap.set(msg.xTabUrl, tab.id);
+    }
+    if (msg && msg.id && port) {
+      port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id });
+    }
+    return { ok: true, tabId: tab.id };
+  } catch (e) {
+    if (msg && msg.id && port) port.postMessage({ type: "result", id: msg.id, error: e.message });
+    return { error: e.message };
+  }
+}
+
+async function handleTimerAction(msg) {
+  try {
+    const win = await browser.windows.getCurrent();
+    const allTabs = await browser.tabs.query({ windowId: win.id });
+    let targetTab = null;
+
+    if (msg.tabId != null) {
+      targetTab = allTabs.find(t => t.id === msg.tabId);
+    } else if (msg.xTabUrl) {
+      const existingId = timerCallerMap.get(msg.xTabUrl);
+      if (existingId != null) {
+        targetTab = allTabs.find(t => t.id === existingId);
+      }
+    }
+    
+    if (!targetTab) {
+      targetTab = allTabs.find(t => isTimerUrl(t.url));
+    }
+    if (!targetTab) {
+      if (msg && msg.id && port) port.postMessage({ type: "result", id: msg.id, error: "No TabTimer tab found" });
+      return { error: "No TabTimer tab found" };
+    }
+
+    const res = await browser.tabs.sendMessage(targetTab.id, {
+      type: "TIMER_ACTION", action: msg.action, value: msg.value,
+    });
+
+    if (msg && msg.id && port) {
+      port.postMessage({ type: "result", id: msg.id, ok: true, tabId: targetTab.id, result: res });
+    }
+    return { ok: true, tabId: targetTab.id, result: res };
+  } catch (e) {
+    if (msg && msg.id && port) port.postMessage({ type: "result", id: msg.id, error: e.message });
+    return { error: e.message };
+  }
+}
+
+// Notify popup when timer tabs change (created/removed/navigated).
+function broadcastTimerTabsChanged() {
+  browser.runtime.sendMessage({ type: "timerTabsChanged" }).catch(() => {});
+}
+
 function handleCommand(msg) {
   if (!port) return;
   switch (msg.type) {
@@ -506,6 +652,9 @@ function handleCommand(msg) {
     case "openSidePanelError": 
       browser.runtime.sendMessage({ type: "sidePanelError", error: msg.error || "Failed to open side panel" }).catch(() => {});
       return;
+    case "getTimerTabs": return handleGetTimerTabs(msg);
+    case "createTimerTab": return handleCreateTimerTab(msg);
+    case "timerAction": return handleTimerAction(msg);
   }
 }
 
@@ -515,9 +664,9 @@ browser.runtime.onStartup.addListener(connect);
 browser.runtime.onInstalled.addListener(connect);
 if (!IS_FIREFOX) { browser.alarms.create("tab-share-poll", { periodInMinutes: 0.1 });
 browser.alarms.onAlarm.addListener((a) => { if (a.name === "tab-share-poll") sendTabs(); }); }
-browser.tabs.onUpdated.addListener(sendTabs);
-browser.tabs.onRemoved.addListener(sendTabs);
-browser.tabs.onCreated.addListener(sendTabs);
-browser.tabs.onActivated.addListener(sendTabs);
+browser.tabs.onUpdated.addListener((...a) => { sendTabs(); broadcastTimerTabsChanged(); });
+browser.tabs.onRemoved.addListener((...a) => { sendTabs(); broadcastTimerTabsChanged(); });
+browser.tabs.onCreated.addListener((...a) => { sendTabs(); broadcastTimerTabsChanged(); });
+browser.tabs.onActivated.addListener((...a) => { sendTabs(); broadcastTimerTabsChanged(); });
 
 connect();

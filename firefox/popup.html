@@ -12,28 +12,82 @@
     .server-item { display: flex; padding: 4px; border-bottom: 1px solid #ccc; }
     .server-path { flex-grow: 1; font-family: monospace; }
     .server-port { font-weight: bold; }
-    #toggle-panel {
-      margin-top: 10px; width: 100%; padding: 7px 0;
-      border: 1px solid #ccc; border-radius: 6px; background: #f8f8f8;
-      font-size: 13px; cursor: pointer; font-family: inherit;
+
+    /* ---- TabTimer section ---- */
+    .timer-section { margin-top: 12px; border-top: 1px solid #ddd; padding-top: 8px; }
+    .timer-header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+    .timer-header h3 { margin: 0; font-size: 14px; flex: 1; }
+    .timer-hdr-btn {
+      border: 1px solid #ccc; border-radius: 4px; background: #f6f8fa;
+      cursor: pointer; font-size: 12px; padding: 2px 6px; font-weight: bold;
     }
-    #toggle-panel:hover { background: #eee; }
+    .timer-hdr-btn:hover { background: #eee; border-color: #999; }
+    #timer-down-val {
+      width: 52px; font-size: 12px; padding: 2px 4px;
+      border: 1px solid #ccc; border-radius: 4px;
+    }
+    .timer-list { max-height: 200px; overflow-y: auto; }
+    .timer-empty { color: #999; font-style: italic; font-size: 12px; }
+    .timer-row {
+      display: flex; align-items: center; gap: 5px;
+      padding: 4px 0; border-bottom: 1px solid #f0f0f0;
+    }
+    .timer-dir { font-weight: bold; font-size: 13px; width: 14px; text-align: center; }
+    .timer-dir.up { color: #1a7f37; }
+    .timer-dir.down { color: #0969da; }
+    .timer-val { font-family: ui-monospace, monospace; font-size: 13px; font-weight: 600; min-width: 58px; }
+    .timer-badge {
+      font-size: 9px; font-weight: 700; padding: 1px 4px; border-radius: 3px;
+      text-transform: uppercase; letter-spacing: 0.3px;
+    }
+    .badge-run { background: #dafbe1; color: #1a7f37; }
+    .badge-pause { background: #fff8c5; color: #9a6700; }
+    .timer-spacer { flex: 1; }
+    .timer-btn {
+      border: 1px solid #d0d7de; border-radius: 3px; background: #fff;
+      cursor: pointer; font-size: 11px; padding: 1px 5px;
+    }
+    .timer-btn:hover { background: #f3f4f6; }
+
+    /* ---- OpenCode section ---- */
+    .opencode-section { margin-top: 12px; border-top: 1px solid #ddd; padding-top: 8px; }
+    .opencode-header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+    .opencode-header h3 { margin: 0; font-size: 14px; flex: 1; }
+    .no-servers { color: #999; font-style: italic; font-size: 12px; margin-top: 4px; }
   </style>
 </head>
 <body>
   <h2>Tab Share</h2>
   <div class="status-line" id="status">Checking...</div>
 
+  <section>
+    <div class="endpoint"><span class="method">GET</span> <code>/tabs</code> — list open tabs</div>
+  </section>
 
+  <!-- TabTimer section -->
+  <section class="timer-section">
+    <div class="timer-header">
+      <h3>⏱ Timers</h3>
+      <button class="timer-hdr-btn" id="btn-up" title="New count-up timer from zero">▲</button>
+      <input type="text" id="timer-down-val" placeholder="5:00" title="Countdown value (H:MM:SS or MM:SS or seconds)">
+      <button class="timer-hdr-btn" id="btn-down" title="New countdown timer">▼</button>
+    </div>
+    <div id="timer-list" class="timer-list">
+      <div class="timer-empty">Loading...</div>
+    </div>
+  </section>
 
-  <button id="toggle-panel">⚡ Toggle opencode panel</button>
-
-  <section id="servers-section" style="display: none;">
-    <h4>Active opencode sessions</h4>
-    <div id="servers-list"></div>
+  <!-- OpenCode section -->
+  <section class="opencode-section">
+    <div class="opencode-header">
+      <h3>⚡ OpenCode</h3>
+      <button class="timer-hdr-btn" id="toggle-panel" title="Toggle opencode panel">Toggle Panel</button>
+    </div>
+    <section id="servers-section" style="display: none;">
+      <div id="servers-list"></div>
+    </section>
   </section>
 
   <script src="popup.js"></script>
 </body>
 </html>
-

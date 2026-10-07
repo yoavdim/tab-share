@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Tab Share (Chromium)",
+  "name": "Tab Share",
   "version": "2.12",
   "description": "Share and manage tabs via local HTTP API",
   "permissions": ["tabs", "tabGroups", "nativeMessaging", "scripting", "alarms", "webRequest", "webRequestAuthProvider", "sidePanel"],
@@ -23,6 +23,11 @@
       "matches": ["file:///*", "http://127.0.0.1/*", "http://localhost/*", "https://yoavdim.github.io/*"],
       "js": ["content.js"],
       "all_frames": true
+    },
+    {
+      "matches": ["https://yoavdim.github.io/TabTimer/*", "https://yoavdim.github.io/TabTimer"],
+      "js": ["tabtimer.js"],
+      "run_at": "document_idle"
     }
   ]
 }

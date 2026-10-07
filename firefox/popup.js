@@ -24,26 +24,18 @@ function escHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
-// Determine the correct API namespace
-
 // Toggle side panel
 document.getElementById("toggle-panel").addEventListener("click", () => {
   if (browser.sidePanel) {
     browser.windows.getCurrent().then(win => {
-      // Ping the side panel to see if it is running
       browser.runtime.sendMessage({ type: "pingSidePanel" }, (response) => {
-        // Clear lastError if side panel isn't listening (meaning it's closed)
         const err = browser.runtime.lastError;
-        
         if (response && response.isOpen) {
-          // It's open, so close it by disabling and re-enabling globally
           browser.sidePanel.setOptions({ enabled: false }).then(() => {
             browser.sidePanel.setOptions({ enabled: true });
           });
         } else {
-          // It's closed, so open it
           browser.sidePanel.open({ windowId: win.id }).catch(e => console.error(e));
-          // Start session if none running
           browser.runtime.sendMessage({ type: "startSessionIfNone" }).catch(() => {});
         }
         window.close();
@@ -62,7 +54,6 @@ browser.runtime.sendMessage({ type: "getEmbeds" }, (res) => {
   const servers = res.servers;
   const section = document.getElementById("servers-section");
   const list = document.getElementById("servers-list");
-  const toggleBtn = document.getElementById("toggle-panel");
 
   section.style.display = "block";
 
@@ -86,3 +77,74 @@ browser.runtime.sendMessage({ type: "getEmbeds" }, (res) => {
   }
 });
 
+// ---- TabTimer popup logic ----
+
+function renderTimers(timers) {
+  const el = document.getElementById("timer-list");
+  if (!el) return;
+  if (!timers || timers.length === 0) {
+    el.innerHTML = '<div class="timer-empty">No timer tabs open</div>';
+    return;
+  }
+  el.innerHTML = timers.map(t => {
+    const isUp = t.direction === "up";
+    const running = !!t.isRunning;
+    return `<div class="timer-row">
+      <span class="timer-dir ${isUp ? "up" : "down"}">${isUp ? "▲" : "▼"}</span>
+      <span class="timer-val">${escHtml(t.value || "--:--")}</span>
+      <span class="timer-badge ${running ? "badge-run" : "badge-pause"}">${running ? "run" : "paused"}</span>
+      <span class="timer-spacer"></span>
+      <button class="timer-btn" data-tid="${t.tabId}" data-act="toggle">${running ? "❚❚" : "▶"}</button>
+      <button class="timer-btn" data-tid="${t.tabId}" data-act="reset">↺</button>
+      <button class="timer-btn" data-tid="${t.tabId}" data-act="goto">↗</button>
+    </div>`;
+  }).join("");
+
+  el.querySelectorAll(".timer-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const tabId = parseInt(btn.dataset.tid, 10);
+      const act = btn.dataset.act;
+      if (act === "goto") {
+        browser.tabs.update(tabId, { active: true });
+        browser.tabs.get(tabId).then(tab => {
+          if (tab && tab.windowId) browser.windows.update(tab.windowId, { focused: true });
+        }).catch(() => {});
+        return;
+      }
+      browser.runtime.sendMessage({ type: "timerAction", action: act, tabId }, () => {
+        loadTimers();
+      });
+    });
+  });
+}
+
+function loadTimers() {
+  browser.runtime.sendMessage({ type: "getTimerTabs" }, (res) => {
+    if (browser.runtime.lastError) return;
+    renderTimers(res ? res.timerTabs : []);
+  });
+}
+
+// Event-driven: background broadcasts timerTabsChanged on tab create/remove/update.
+browser.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === "timerTabsChanged") loadTimers();
+});
+
+// Also poll every second for live value updates (popup is short-lived).
+loadTimers();
+setInterval(loadTimers, 1000);
+
+// ▲ button: new count-up timer
+document.getElementById("btn-up").addEventListener("click", () => {
+  browser.runtime.sendMessage({ type: "createTimerTab", value: "stoper", direction: "up" });
+});
+
+// ▼ button: new countdown timer
+document.getElementById("btn-down").addEventListener("click", () => {
+  const val = (document.getElementById("timer-down-val").value || "").trim();
+  browser.runtime.sendMessage({
+    type: "createTimerTab",
+    value: val || "5:00",
+    direction: "down",
+  });
+});

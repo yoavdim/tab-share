@@ -71,7 +71,7 @@ _LOCALHOST_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
 TRUSTED_PUBLIC_ORIGINS = frozenset({"https://yoavdim.github.io"})
 # Endpoints safe enough to also expose to the file:// (Origin: null) split-tab UI,
 # and to TRUSTED_PUBLIC_ORIGINS.
-FILE_OK_PATHS = frozenset({"/tabs", "/navigate"})
+FILE_OK_PATHS = frozenset({"/tabs", "/navigate", "/timertabs", "/timeraction"})
 # /opencode is gated separately (its own tab-focus check), but still needs to be
 # listed here so _allowed_origin lets the browser read its response.
 EMBED_OK_PATHS = frozenset({"/opencode"})
@@ -337,6 +337,65 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(200, json.dumps(result))
             else:
                 self._json_response(504, json.dumps({"error": "timeout"}))
+        elif self.path == "/timertabs" or self.path.startswith("/timertabs?"):
+            origin = self.headers.get("Origin")
+            x_tab_url = self.headers.get("X-Tab-Url") or ""
+            if origin is not None and origin != "null":
+                if not x_tab_url.startswith(origin):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+            elif origin == "null":
+                if not x_tab_url.startswith("file://"):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+            active, _ = _cached_tabs()
+            if not active or active.get("url") != x_tab_url:
+                self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                return
+
+            import urllib.parse
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            include_log = qs.get("include_log", [""])[0] not in ("", "0", "false")
+            result = send_and_wait({"type": "getTimerTabs", "include_log": include_log})
+            if result:
+                timer_tabs = result.get("timerTabs", [])
+                self._json_response(200, json.dumps(timer_tabs))
+            else:
+                self._json_response(504, json.dumps({"error": "timeout"}))
+        elif self.path.startswith("/timeraction"):
+            origin = self.headers.get("Origin")
+            x_tab_url = self.headers.get("X-Tab-Url") or ""
+            if origin is not None and origin != "null":
+                if not x_tab_url.startswith(origin):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+            elif origin == "null":
+                if not x_tab_url.startswith("file://"):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+            active, _ = _cached_tabs()
+            if not active or active.get("url") != x_tab_url:
+                self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                return
+
+            import urllib.parse
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            action = params.get("action", [None])[0]
+            if not action:
+                self._json_response(400, json.dumps({"error": "action query parameter required"}))
+                return
+            tab_id_str = params.get("tabId", params.get("tabid", [None]))[0]
+            tab_id = int(tab_id_str) if tab_id_str and tab_id_str.isdigit() else None
+            value = params.get("value", [None])[0]
+            msg = {"type": "timerAction", "action": action, "xTabUrl": x_tab_url}
+            if tab_id is not None: msg["tabId"] = tab_id
+            if value is not None: msg["value"] = value
+            result = send_and_wait(msg)
+            if result:
+                self._json_response(200, json.dumps(result))
+            else:
+                self._json_response(504, json.dumps({"error": "timeout"}))
         else:
             self.send_error(404)
 
@@ -482,6 +541,30 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(200, json.dumps(result))
             else:
                 self._json_response(504, json.dumps({"error": "timeout"}))
+        elif self.path == "/timertabs" or self.path.startswith("/timertabs?"):
+            # POST /timertabs: create a new timer tab.
+            origin = self.headers.get("Origin")
+            x_tab_url = self.headers.get("X-Tab-Url") or ""
+            if origin is not None and origin != "null":
+                if not x_tab_url.startswith(origin):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+            elif origin == "null":
+                if not x_tab_url.startswith("file://"):
+                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                    return
+            active, _ = _cached_tabs()
+            if not active or active.get("url") != x_tab_url:
+                self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+                return
+
+            val = body.get("value", "stoper")
+            direction = body.get("direction", "up")
+            result = send_and_wait({"type": "createTimerTab", "value": val, "direction": direction, "xTabUrl": x_tab_url})
+            if result:
+                self._json_response(200, json.dumps(result))
+            else:
+                self._json_response(504, json.dumps({"error": "timeout"}))
         else:
             self.send_error(404)
 
@@ -553,7 +636,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", allowed)
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Tab-Url")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Tab-Url, X-Tab-Id")
         if allowed in TRUSTED_PUBLIC_ORIGINS:
             # Chrome's Local Network Access: a public HTTPS origin reaching a
             # localhost/private-network server also needs this on top of ACAO, or
