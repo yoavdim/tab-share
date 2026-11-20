@@ -2,19 +2,26 @@
 const IS_FIREFOX = navigator.userAgent.includes("Firefox");
 const PORT = IS_FIREFOX ? 8765 : 8766;
 
-// Native host status
-fetch(`http://127.0.0.1:${PORT}/tabs`)
-  .then(r => r.json())
-  .then(d => {
-    const el = document.getElementById("status");
-    el.textContent = `✓ ${d.tabs?.length ?? 0} tab${d.tabs?.length === 1 ? "" : "s"} on :${PORT}`;
-    el.className = "status-line ok";
-  })
-  .catch(() => {
-    const el = document.getElementById("status");
+// Split-mode badge: show when the active tab is a page-API-eligible tab in a split view.
+browser.runtime.sendMessage({ type: "getSplitMode" }, (res) => {
+  if (browser.runtime.lastError) return;
+  if (res && res.splitMode) {
+    document.getElementById("split-badge").style.display = "inline-block";
+  }
+});
+
+// Native host status + live tab count from the background script.
+browser.runtime.sendMessage({ type: "getTabCount" }, (res) => {
+  const el = document.getElementById("status");
+  if (browser.runtime.lastError || !res || !res.ok) {
     el.textContent = "✗ Native host not responding";
     el.className = "status-line err";
-  });
+    return;
+  }
+  const count = res.count;
+  el.textContent = `✓ ${count} tab${count === 1 ? "" : "s"} on :${PORT}`;
+  el.className = "status-line ok";
+});
 
 function escHtml(s) {
   return String(s)

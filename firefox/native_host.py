@@ -47,37 +47,17 @@ write_lock = threading.Lock()
 is_chrome = len(sys.argv) > 1 and sys.argv[1].startswith("chrome-extension://")
 PORT = 8766 if is_chrome else 8765
 
-# ---- CORS policy ----------------------------------------------------------
-# Localhost origins may reach every endpoint. The file:// interface (tracker.html
-# split-tab view) is served from disk, so browsers send it as `Origin: null`; it
-# is only allowed to reach the low-risk endpoints it actually needs (/tabs, /navigate,
-# /opencode — see EMBED_OK_PATHS below). Other sensitive endpoints (/eval, /query,
-# /scroll, /open, /extract, /close, ...) are localhost-only.
-# curl (our agent) sends no Origin header and ignores CORS entirely, so it is
-# unaffected — this only constrains what browser pages of other origins can call.
-#
-# For `Origin: null` specifically, /tabs is allowed from either member of the
-# split pair (so the background pane can poll), while /navigate requires the
-# requester to be the *active* (focused) file:// tab.
-# Localhost and no-Origin callers are unaffected.
-#
-# yoavdim.github.io is trusted the same as the file:// (null) case: same FILE_OK_PATHS
-# restriction, gated on the currently-focused tab actually being on that origin (see
-# _focused_tab_matches_origin) rather than the split-pair logic file:// uses. Since it's
-# a public HTTPS origin rather than file://, Chrome's Local Network Access also gates
-# it: the browser prompts the user once, and our preflight must send
-# Access-Control-Allow-Private-Network: true or the request is blocked regardless of ACAO.
-_LOCALHOST_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
-TRUSTED_PUBLIC_ORIGINS = frozenset({"https://yoavdim.github.io"})
-# Endpoints safe enough to also expose to the file:// (Origin: null) split-tab UI,
-# and to TRUSTED_PUBLIC_ORIGINS.
-FILE_OK_PATHS = frozenset({"/tabs", "/navigate", "/timertabs", "/timeraction"})
-# /opencode is gated separately (its own tab-focus check), but still needs to be
-# listed here so _allowed_origin lets the browser read its response.
-EMBED_OK_PATHS = frozenset({"/opencode"})
-# Sentinel reasons returned to a null-origin caller instead of real tab data.
-NO_SPLIT_TABS = "NO_SPLIT_TABS"       # no split-view pair exists right now
-NOT_ALLOWED = "NOT_ALLOWED"           # target tab isn't the focused tab or its partner
+# ---- Access policy --------------------------------------------------------
+# The REST API is for local tools (curl / agents) and the extension itself only:
+#   - No Origin header is accepted only from NON-browser clients (curl, agents, etc.).
+#     A request that identifies itself as a browser (User-Agent: Mozilla/...) but
+#     carries no Origin is blocked.
+#   - The extension origin ((chrome|moz)-extension://...) is allowed.
+#   - Every other origin (localhost web apps, file://, public websites) is blocked.
+# Web pages talk to the extension through content.js's TabShareFetch() instead.
+_ALLOWED_ORIGIN_RE = re.compile(r"^((chrome|moz)-extension://[a-zA-Z0-9_-]+)$")
+_BROWSER_UA_RE = re.compile(r"Mozilla/|Chrome/|Chromium/|Firefox/|Safari/|Gecko/|Edg/|OPR/", re.I)
+NOT_ALLOWED = "NOT_ALLOWED"
 
 # ---- /opencode: one `opencode serve` per workspace folder -----------------
 # Runs `opencode serve` with cwd=<folder> (or $HOME if omitted), protected by a
@@ -225,36 +205,6 @@ def _get_or_start_embed(real_path):
             _embed_starting.discard(real_path)
 
 
-def _cached_tabs():
-    """Parse the last snapshot pushed from the extension. (activeTab, tabs) or
-    (None, []) if nothing has been cached yet."""
-    with lock:
-        raw = state["data"]
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return None, []
-    return data.get("activeTab"), (data.get("tabs") or [])
-
-
-def _focused_split_pair():
-    """(active_tab_id, partner_tab_id) for the tab in focus's split-view partner, or
-    (None, None) if there is no active tab, or it isn't part of a valid split pair
-    right now."""
-    active, tabs = _cached_tabs()
-    if not active:
-        return None, None
-    svid = active.get("splitViewId")
-    if svid is None or svid == -1:
-        return None, None
-    active_id = active.get("id")
-    partner = next((t for t in tabs
-                    if t.get("splitViewId") == svid and t.get("id") != active_id), None)
-    if partner is None:
-        return None, None
-    return active_id, partner.get("id")
-
-
 def read_message():
     raw = sys.stdin.buffer.read(4)
     if len(raw) < 4:
@@ -288,34 +238,9 @@ def send_and_wait(msg, timeout=5):
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if not self._gate():
+            return
         if self.path == "/tabs":
-            if self._is_trusted_public_origin():
-                if not self._focused_tab_matches_origin():
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-                with lock:
-                    data = state["data"]
-                self._json_response(200, data)
-                return
-            if self._is_null_origin():
-                active_id, partner_id = _focused_split_pair()
-                if active_id is None:
-                    self._json_response(200, json.dumps({"error": NO_SPLIT_TABS}))
-                    return
-                active, tabs = _cached_tabs()
-                req_url = self.headers.get("X-Tab-Url") or ""
-                split_urls = {t.get("url") for t in tabs if t.get("id") in (active_id, partner_id)}
-                if not (req_url.startswith("file://") and req_url in split_urls):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-                split_tabs = [t for t in tabs if t.get("id") in (active_id, partner_id)]
-                narrowed_data = json.dumps({
-                    "type": "tabs",
-                    "activeTab": active,
-                    "tabs": split_tabs
-                })
-                self._json_response(200, narrowed_data)
-                return
             with lock:
                 data = state["data"]
             self._json_response(200, data)
@@ -338,21 +263,6 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json_response(504, json.dumps({"error": "timeout"}))
         elif self.path == "/timertabs" or self.path.startswith("/timertabs?"):
-            origin = self.headers.get("Origin")
-            x_tab_url = self.headers.get("X-Tab-Url") or ""
-            if origin is not None and origin != "null":
-                if not x_tab_url.startswith(origin):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-            elif origin == "null":
-                if not x_tab_url.startswith("file://"):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-            active, _ = _cached_tabs()
-            if not active or active.get("url") != x_tab_url:
-                self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                return
-
             import urllib.parse
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             include_log = qs.get("include_log", [""])[0] not in ("", "0", "false")
@@ -363,21 +273,6 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json_response(504, json.dumps({"error": "timeout"}))
         elif self.path.startswith("/timeraction"):
-            origin = self.headers.get("Origin")
-            x_tab_url = self.headers.get("X-Tab-Url") or ""
-            if origin is not None and origin != "null":
-                if not x_tab_url.startswith(origin):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-            elif origin == "null":
-                if not x_tab_url.startswith("file://"):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-            active, _ = _cached_tabs()
-            if not active or active.get("url") != x_tab_url:
-                self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                return
-
             import urllib.parse
             parsed = urllib.parse.urlparse(self.path)
             params = urllib.parse.parse_qs(parsed.query)
@@ -388,7 +283,7 @@ class Handler(BaseHTTPRequestHandler):
             tab_id_str = params.get("tabId", params.get("tabid", [None]))[0]
             tab_id = int(tab_id_str) if tab_id_str and tab_id_str.isdigit() else None
             value = params.get("value", [None])[0]
-            msg = {"type": "timerAction", "action": action, "xTabUrl": x_tab_url}
+            msg = {"type": "timerAction", "action": action}
             if tab_id is not None: msg["tabId"] = tab_id
             if value is not None: msg["value"] = value
             result = send_and_wait(msg)
@@ -400,6 +295,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if not self._gate():
+            return
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length)) if length else {}
 
@@ -478,27 +375,6 @@ class Handler(BaseHTTPRequestHandler):
             if not url:
                 self._json_response(400, json.dumps({"error": "url required"}))
                 return
-            if self._is_trusted_public_origin():
-                if not self._focused_tab_matches_origin():
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-            elif self._is_null_origin():
-                # file:// pages may only redirect the focused tab's split partner.
-                active_id, partner_id = _focused_split_pair()
-                if active_id is None:
-                    self._json_response(200, json.dumps({"error": NO_SPLIT_TABS}))
-                    return
-                active, tabs = _cached_tabs()
-                if not (active and active.get("url", "").startswith("file://")):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-                if self.headers.get("X-Tab-Url") != active.get("url"):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-                requested = body.get("tabId")
-                if requested != partner_id or body.get("newTab"):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
             msg = {"type": "navigate", "url": url}
             for k in ("tabId", "newTab", "cookieStoreId", "timeoutMs"):
                 if body.get(k) is not None:
@@ -543,24 +419,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(504, json.dumps({"error": "timeout"}))
         elif self.path == "/timertabs" or self.path.startswith("/timertabs?"):
             # POST /timertabs: create a new timer tab.
-            origin = self.headers.get("Origin")
-            x_tab_url = self.headers.get("X-Tab-Url") or ""
-            if origin is not None and origin != "null":
-                if not x_tab_url.startswith(origin):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-            elif origin == "null":
-                if not x_tab_url.startswith("file://"):
-                    self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                    return
-            active, _ = _cached_tabs()
-            if not active or active.get("url") != x_tab_url:
-                self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
-                return
-
             val = body.get("value", "stoper")
             direction = body.get("direction", "up")
-            result = send_and_wait({"type": "createTimerTab", "value": val, "direction": direction, "xTabUrl": x_tab_url})
+            result = send_and_wait({"type": "createTimerTab", "value": val, "direction": direction})
             if result:
                 self._json_response(200, json.dumps(result))
             else:
@@ -569,8 +430,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_OPTIONS(self):
-        # Preflight: reflect the allowed origin (if any) so the browser lets the
-        # real request through. A disallowed cross-origin call is blocked here.
+        # Preflight: only localhost origins pass the gate (and get ACAO headers).
+        if not self._gate():
+            return
         self.send_response(204)
         self._cors_headers()
         self.end_headers()
@@ -582,66 +444,38 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data.encode() if isinstance(data, str) else data)
 
-    def _is_null_origin(self):
-        """True only for the file:// (`Origin: null`) case this extra narrowing targets.
-        Localhost origins and no-Origin (curl/agentic) callers are never true here, so
-        they reach /tabs and /navigate exactly as before."""
-        return self.headers.get("Origin") == "null"
-
-    def _is_trusted_public_origin(self):
-        """True only for TRUSTED_PUBLIC_ORIGINS (e.g. yoavdim.github.io)."""
-        return self.headers.get("Origin") in TRUSTED_PUBLIC_ORIGINS
-
-    def _focused_tab_matches_origin(self):
-        """True if the browser's currently-focused tab is actually on the caller's
-        declared Origin. This is the real gate for TRUSTED_PUBLIC_ORIGINS requests:
-        proves the request is coming from a tab the user is looking at right now, on
-        that origin, rather than any script that merely knows the Origin string."""
-        origin = self.headers.get("Origin") or ""
-        active, _ = _cached_tabs()
-        return bool(active) and (active.get("url") or "").startswith(origin + "/")
-
-    def _allowed_origin(self):
-        """Return the Origin value to echo in Access-Control-Allow-Origin, or None
-        if this origin isn't allowed to reach this path.
-
-        - No Origin header (curl / same-process tools): unrestricted — return None
-          and the caller emits no ACAO header (CORS is irrelevant without an Origin).
-        - localhost/127.0.0.1 origins: allowed on every endpoint.
-        - file:// pages (sent as `Origin: null`): allowed only on FILE_OK_PATHS.
-        - TRUSTED_PUBLIC_ORIGINS (e.g. yoavdim.github.io): allowed only on FILE_OK_PATHS,
-          same as file://.
-        - anything else: denied.
-        """
+    def _request_allowed(self):
+        """Access policy (see top of file): localhost/extension origin, or a non-browser client
+        that sends no Origin. A browser-looking User-Agent with no Origin is rejected,
+        as is every other Origin (null / file:// / public sites)."""
         origin = self.headers.get("Origin")
         if origin is None:
-            return None  # non-browser client; no CORS restriction applies
-        path = self.path.split("?", 1)[0]
-        if _LOCALHOST_ORIGIN_RE.match(origin):
-            return origin
-        if origin == "null" and path in (FILE_OK_PATHS | EMBED_OK_PATHS):
-            return "null"
-        if origin in TRUSTED_PUBLIC_ORIGINS and path in (FILE_OK_PATHS | EMBED_OK_PATHS):
-            return origin
-        return False  # explicitly disallowed
+            return not _BROWSER_UA_RE.search(self.headers.get("User-Agent") or "")
+        return bool(_ALLOWED_ORIGIN_RE.match(origin))
+
+    def _gate(self):
+        """True if the request may proceed; otherwise responds 403 and returns False."""
+        # DNS rebinding protection: reject if Host header doesn't match our bind address
+        host = self.headers.get("Host", "")
+        if not (host.startswith("127.0.0.1:") or host.startswith("localhost:")):
+            self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+            return False
+        
+        if self._request_allowed():
+            return True
+        self._json_response(403, json.dumps({"error": NOT_ALLOWED}))
+        return False
 
     def _cors_headers(self):
-        allowed = self._allowed_origin()
-        if allowed is None:
-            # No Origin header — non-browser caller; skip CORS headers entirely.
+        # Only allowed origins ever get CORS headers; everyone else is rejected by
+        # _gate() and the browser blocks the read for lack of ACAO.
+        origin = self.headers.get("Origin")
+        if origin is None or not _ALLOWED_ORIGIN_RE.match(origin):
             return
-        if allowed is False:
-            # Disallowed browser origin: emit no ACAO so the browser blocks the read.
-            return
-        self.send_header("Access-Control-Allow-Origin", allowed)
+        self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Tab-Url, X-Tab-Id")
-        if allowed in TRUSTED_PUBLIC_ORIGINS:
-            # Chrome's Local Network Access: a public HTTPS origin reaching a
-            # localhost/private-network server also needs this on top of ACAO, or
-            # the browser blocks the request regardless (separate from CORS).
-            self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def log_message(self, *_):
         pass

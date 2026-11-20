@@ -1,0 +1,34 @@
+{
+  "browser_ua_regex": "Mozilla/|Chrome/|Chromium/|Firefox/|Safari/|Gecko/|Edg/|OPR/|WebKit/|AppleWebKit/",
+
+  "origin_patterns": {
+    "extension": "^(chrome|moz)-extension://[a-zA-Z0-9_-]+$",
+    "localhost":  "^https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?$",
+    "whitelist":  ["https://yoavdim.github.io"]
+  },
+
+  "surfaces": {
+    "rest_api": {
+      "allowed_origins": ["extension"],
+      "allow_no_origin_non_browser": true,
+      "endpoints": [
+        "GET /tabs", "GET /groups", "GET /containers", "GET /active",
+        "GET /timertabs", "GET /timeraction",
+        "POST /open", "POST /group", "POST /eval", "POST /query",
+        "POST /scroll", "POST /navigate", "POST /extract", "POST /close",
+        "POST /timertabs"
+      ]
+    },
+    "page_api": {
+      "allowed_origins": ["file://", "whitelist", "localhost"],
+      "endpoints": {
+        "get_split":      { "require_active": false, "require_split": false },
+        "set_split":      { "require_active": true,  "require_split": true  },
+        "get_timers":     { "require_active": true,  "require_split": false },
+        "timer_action":   { "require_active": true,  "require_split": false },
+        "create_timer":   { "require_active": true,  "require_split": false },
+        "open_side_panel":{ "require_active": true,  "require_split": false }
+      }
+    }
+  }
+}

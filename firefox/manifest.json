@@ -26,13 +26,14 @@
     {
       "matches": ["file:///*", "http://127.0.0.1/*", "http://localhost/*", "https://yoavdim.github.io/*"],
       "js": ["content.js"],
-      "all_frames": true
+      "all_frames": false
     },
     {
       "matches": ["https://yoavdim.github.io/TabTimer/*", "https://yoavdim.github.io/TabTimer"],
       "js": ["tabtimer.js"],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "web_accessible_resources": ["policy.json"]
 }
 

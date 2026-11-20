@@ -6,7 +6,8 @@
 (function () {
   const TIMER_URL_PREFIX = "https://yoavdim.github.io/TabTimer";
 
-  // Only run on TabTimer pages.
+  // Only run on TabTimer pages, never inside iframes.
+  if (window.top !== window) return;
   if (!location.href.startsWith(TIMER_URL_PREFIX)) return;
 
   function getTimerState(opts) {

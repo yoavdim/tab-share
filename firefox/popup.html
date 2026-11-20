@@ -5,6 +5,14 @@
   <style>
     body { width: 340px; margin: 0; padding: 12px; font-family: system-ui, sans-serif; font-size: 13px; }
     h2 { margin: 0 0 8px; font-size: 15px; }
+    .title-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .title-row h2 { margin: 0; }
+    #split-badge {
+      display: none;
+      font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 10px;
+      background: #d1fae5; color: #065f46; border: 1px solid #6ee7b7;
+      letter-spacing: 0.3px; white-space: nowrap;
+    }
     code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
     .endpoint { margin: 6px 0; }
     .method { font-weight: bold; color: #333; }
@@ -57,7 +65,10 @@
   </style>
 </head>
 <body>
-  <h2>Tab Share</h2>
+  <div class="title-row">
+    <h2>Tab Share</h2>
+    <span id="split-badge">split mode: on</span>
+  </div>
   <div class="status-line" id="status">Checking...</div>
 
   <section>

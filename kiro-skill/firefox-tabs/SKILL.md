@@ -136,7 +136,7 @@ curl -s -X POST http://localhost:8765/scroll \
 Returns `{ ok, position, ready }` — `position` is `"scrollTop/scrollHeight"`, or
 `"no-match"` when the selector matched nothing.
 
-> **CORS:** `localhost` origins reach every endpoint; `file://` pages only `/tabs` + `/navigate`; other websites are denied. `curl` is unaffected.
+> **Access:** `localhost` origins and non-browser clients (`curl`) reach every endpoint. Browser requests with no `Origin`, `file://` pages and other websites are denied; pages use `TabShareFetch` (see README) instead.
 
 ## Workflow for Opening Tabs in Groups
 

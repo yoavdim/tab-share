@@ -197,21 +197,30 @@ The HTTP API and `native_host.py` are identical across both versions. The skills
 | Containers | Multi-Account Containers | **Not supported** — `/containers` returns `[]`, `cookieStoreId` ignored |
 | Host registration | `~/.mozilla/native-messaging-hosts/`, `allowed_extensions` | per-browser `NativeMessagingHosts/`, `allowed_origins` with the extension ID |
 
-## Security (CORS)
+## Security
 
-The host binds to `127.0.0.1` only, and its CORS policy limits which *browser* origins can
-call it (both builds behave the same):
+The host binds to `127.0.0.1` only. REST access policy (both builds behave the same):
 
 - **`localhost` / `127.0.0.1` origins** — allowed on every endpoint.
-- **`file://` pages** (browsers send `Origin: null`) — restricted strictly to split-view
-  manipulation. They can only reach `/tabs` and `/navigate`, and **only** if the currently
-  active tab is a `file://` URL that is part of a split-view pair. They must also send a matching `X-Tab-Url` header. The API strictly sandboxes
-  the payload, meaning the `file://` page can only see and navigate its specific split-view
-  partner. Sensitive endpoints (`/eval`, `/query`, `/scroll`, `/open`, `/extract`, `/close`, `/group`) are completely blocked.
-- **Any other website** — denied on all endpoints, so a random page you visit can't drive
-  your browser.
-- **`curl` / non-browser clients** send no `Origin` header and are unaffected — CORS only
-  constrains cross-origin *browser* requests.
+- **`curl` / non-browser clients** (no `Origin`, non-browser `User-Agent`) — allowed.
+- **Browser-looking requests with no `Origin`** (e.g. a `no-cors` GET) — blocked (403).
+- **Everything else** (`file://` pages / `Origin: null`, public websites) — blocked on all endpoints.
+
+### `TabShareFetch` (pages: file://, yoavdim.github.io, localhost)
+
+Web pages never call the REST host. Instead the content script (top frame only, never in
+iframes) exposes `window.TabShareFetch(endpoint, params)` -> `Promise<{ok, ...}>`. The
+extension identifies the caller from the browser-supplied message sender (real tab id and
+URL), so a page cannot fake either one, and no tab ids of the page or its split partner are
+exposed.
+
+| endpoint | params | result | notes |
+|---|---|---|---|
+| `get_split` | – | `{ok, url}` (`url` is `null` if no split) | callable from either pane |
+| `set_split` | `{url}` (http/https/file) | `{ok}` | caller must be the active pane; never opens a new tab |
+| `get_timers` | `{include_log?}` | `{ok, timers}` | caller must be the active tab |
+| `timer_action` | `{action, value?, tabId?}` | `{ok, ...}` | caller must be the active tab |
+| `create_timer` | `{value?, direction?}` | `{ok, tabId}` | caller must be the active tab |
 
 ## Kiro skill
 

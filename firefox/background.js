@@ -160,7 +160,16 @@ function queryElements(selector) {
   } catch (e) {
     return { error: "invalid selector: " + String(e) };
   }
-  const items = Array.from(els, el => el.outerHTML);
+  // Filter out top-level form field elements and strip nested ones from others
+  // to prevent leaking field values via outerHTML.
+  const SENSITIVE = new Set(["INPUT", "TEXTAREA", "SELECT"]);
+  const items = Array.from(els)
+    .filter(el => !SENSITIVE.has(el.tagName))
+    .map(el => {
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll("input, textarea, select, script, style").forEach(i => i.remove());
+      return clone.outerHTML;
+    });
   return { count: items.length, items: items, ready: document.readyState };
 }
 
@@ -430,6 +439,13 @@ browser.runtime.onMessage.addListener((req, sender, sendResponse) => {
     }
     sendResponse({ servers });
 
+  } else if (req.type === "getTabCount") {
+    if (!port) { sendResponse({ ok: false }); return; }
+    browser.tabs.query({ currentWindow: true })
+      .then(tabs => sendResponse({ ok: true, count: tabs.length }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+
   } else if (req.type === "startSessionIfNone") {
     // Internal event from popup or sidepanel
     if (!sender.tab && embedAuthMap.size === 0) {
@@ -440,40 +456,32 @@ browser.runtime.onMessage.addListener((req, sender, sendResponse) => {
       }
     }
     sendResponse({ ok: true });
-  } else if (req.type === "openSidePanelFromContent") {
-    // Fired from content script during a user click
-    const tab = sender.tab;
-    if (!tab) { sendResponse({ ok: false }); return true; }
-    
-    const isAllowed = tab.url.startsWith("file://") || 
-                      tab.url.startsWith("http://127.0.0.1") ||
-                      tab.url.startsWith("http://localhost") ||
-                      tab.url.startsWith("https://yoavdim.github.io");
-    
-    if (!isAllowed) { sendResponse({ ok: false }); return true; }
-
-    if (IS_FIREFOX) {
-      browser.sidebarAction.open().catch(e => console.error("sidebarAction.open error:", e));
-    } else {
-      browser.sidePanel.open({ windowId: tab.windowId }).catch(e => console.error("sidePanel.open error:", e));
-    }
-    
-    if (port) {
-      port.postMessage({ type: "startOpencode", tabId: sender.tab.id, windowId: sender.tab.windowId, path: req.path });
-    }
-    
-    sendResponse({ ok: true });
-    return true;
   } else if (req.type === "getOpencodePort") {
     sendResponse({ port: latestOpencodePort });
-  } else if (req.type === "getTimerTabs") {
+  } else if (req.type === "getTimerTabs" && !sender.tab) {
     handleGetTimerTabs(req).then(timerTabs => sendResponse({ timerTabs }));
     return true;
-  } else if (req.type === "createTimerTab") {
+  } else if (req.type === "createTimerTab" && !sender.tab) {
     handleCreateTimerTab(req).then(res => sendResponse(res));
     return true;
-  } else if (req.type === "timerAction") {
+  } else if (req.type === "timerAction" && !sender.tab) {
     handleTimerAction(req).then(res => sendResponse(res));
+    return true;
+  } else if (req.type === "getSplitMode") {
+    browser.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
+      if (!tab) { sendResponse({ splitMode: false }); return; }
+      if (isPageApiUrl(tab.url)) {
+        const partner = await findSplitPartner(tab);
+        sendResponse({ splitMode: partner !== null });
+      } else {
+        const partner = await findSplitPartner(tab);
+        sendResponse({ splitMode: partner !== null && isPageApiUrl(partner.url) });
+      }
+    }).catch(() => sendResponse({ splitMode: false }));
+    return true;
+  } else if (req.type === "tabShareFetch") {
+    // From content.js TabShareFetch(). Identity comes from `sender`, never from the page.
+    handlePageFetch(req, sender).then(res => sendResponse(res));
     return true;
   }
 });
@@ -499,7 +507,7 @@ browser.webRequest.onAuthRequired.addListener(
 // ---- TabTimer integration ----
 
 const TIMER_URL_PREFIX = "https://yoavdim.github.io/TabTimer";
-const timerCallerMap = new Map(); // Maps X-Tab-Url -> tabId
+const timerCallerMap = new Map(); // caller tabId (browser-verified) -> timer tabId
 
 function isTimerUrl(url) {
   if (!url) return false;
@@ -551,8 +559,8 @@ async function handleCreateTimerTab(msg) {
     const win = await browser.windows.getCurrent();
     const allTabs = await browser.tabs.query({ windowId: win.id });
 
-    if (msg.xTabUrl) {
-      const existingId = timerCallerMap.get(msg.xTabUrl);
+    if (msg.callerTabId != null) {
+      const existingId = timerCallerMap.get(msg.callerTabId);
       if (existingId != null) {
         const existingTab = allTabs.find(t => t.id === existingId);
         if (existingTab && isTimerUrl(existingTab.url)) {
@@ -578,8 +586,8 @@ async function handleCreateTimerTab(msg) {
     }
 
     const tab = await browser.tabs.create({ url: targetUrl, windowId: win.id });
-    if (msg.xTabUrl) {
-      timerCallerMap.set(msg.xTabUrl, tab.id);
+    if (msg.callerTabId != null) {
+      timerCallerMap.set(msg.callerTabId, tab.id);
     }
     if (msg && msg.id && port) {
       port.postMessage({ type: "result", id: msg.id, ok: true, tabId: tab.id });
@@ -598,15 +606,15 @@ async function handleTimerAction(msg) {
     let targetTab = null;
 
     if (msg.tabId != null) {
-      targetTab = allTabs.find(t => t.id === msg.tabId);
-    } else if (msg.xTabUrl) {
-      const existingId = timerCallerMap.get(msg.xTabUrl);
+      targetTab = allTabs.find(t => t.id === msg.tabId && isTimerUrl(t.url));
+    } else if (msg.callerTabId != null) {
+      const existingId = timerCallerMap.get(msg.callerTabId);
       if (existingId != null) {
         targetTab = allTabs.find(t => t.id === existingId);
       }
     }
     
-    if (!targetTab) {
+    if (!targetTab && msg.tabId == null) {
       targetTab = allTabs.find(t => isTimerUrl(t.url));
     }
     if (!targetTab) {
@@ -631,6 +639,147 @@ async function handleTimerAction(msg) {
 // Notify popup when timer tabs change (created/removed/navigated).
 function broadcastTimerTabsChanged() {
   browser.runtime.sendMessage({ type: "timerTabsChanged" }).catch(() => {});
+}
+
+// ---- Policy loading and initialization -------------------------------------
+let POLICY = null;
+let PAGE_API_ALLOWED_ORIGINS = [];
+let ENDPOINT_REQUIREMENTS = {};
+
+async function loadPolicy() {
+  try {
+    const url = browser.runtime.getURL("policy.json");
+    const response = await fetch(url);
+    POLICY = await response.json();
+    
+    // Build allowed origins list from policy
+    const patterns = POLICY.origin_patterns;
+    const allowed = POLICY.surfaces.page_api.allowed_origins;
+    PAGE_API_ALLOWED_ORIGINS = [];
+    
+    for (const ref of allowed) {
+      if (ref === "file://") {
+        PAGE_API_ALLOWED_ORIGINS.push("file://");
+      } else if (ref === "localhost") {
+        PAGE_API_ALLOWED_ORIGINS.push("localhost");
+      } else if (ref === "whitelist" && Array.isArray(patterns.whitelist)) {
+        PAGE_API_ALLOWED_ORIGINS.push(...patterns.whitelist);
+      }
+    }
+    
+    // Cache endpoint requirements
+    ENDPOINT_REQUIREMENTS = POLICY.surfaces.page_api.endpoints;
+  } catch (e) {
+    console.error("Failed to load policy.json:", e);
+  }
+}
+
+// Load policy at startup
+loadPolicy();
+
+// ---- Page API: content.js TabShareFetch(endpoint, params) ----
+// Web pages (file://, trusted public site, localhost) cannot be trusted to say who
+// they are, so they never talk to the REST host. content.js forwards their request
+// here; the browser attaches `sender` (tab, frame, url), which pages cannot forge.
+// All restrictions below are derived from `sender`, never from page-supplied values.
+const NOT_ALLOWED = { ok: false, error: "NOT_ALLOWED" };
+
+function isPageApiUrl(url) {
+  if (!url) return false;
+  if (url.startsWith("file://")) return PAGE_API_ALLOWED_ORIGINS.includes("file://");
+  try {
+    const u = new URL(url);
+    if (u.protocol === "https:") return PAGE_API_ALLOWED_ORIGINS.includes(u.origin);
+    if (u.protocol === "http:") {
+      if (u.hostname === "localhost" || u.hostname === "127.0.0.1") {
+        return PAGE_API_ALLOWED_ORIGINS.includes("localhost");
+      }
+    }
+  } catch (e) {}
+  return false;
+}
+
+// The other pane of `tab`'s split view, or null. Page never sees the partner's tabId.
+async function findSplitPartner(tab) {
+  const svid = tab.splitViewId;
+  if (svid === undefined || svid === null || svid === -1) return null;
+  const tabs = await browser.tabs.query({ windowId: tab.windowId });
+  return tabs.find(t => t.splitViewId === svid && t.id !== tab.id) || null;
+}
+
+async function handlePageFetch(req, sender) {
+  try {
+    if (!sender.tab || sender.frameId !== 0 || !isPageApiUrl(sender.url)) return NOT_ALLOWED;
+    const tab = await browser.tabs.get(sender.tab.id);   // fresh state
+    const params = (req.params && typeof req.params === "object") ? req.params : {};
+    const caller = tab.id;
+    
+    // Check endpoint requirements from policy
+    const requirements = ENDPOINT_REQUIREMENTS[req.endpoint];
+    if (!requirements) return { ok: false, error: "UNSUPPORTED_ENDPOINT" };
+    
+    if (requirements.require_active && !tab.active) return NOT_ALLOWED;
+    if (requirements.require_split) {
+      const partner = await findSplitPartner(tab);
+      if (!partner) return NOT_ALLOWED;
+    }
+
+    switch (req.endpoint) {
+      case "get_split": {
+        const partner = await findSplitPartner(tab);
+        return { ok: true, url: partner ? partner.url : null, title: partner ? partner.title : null };
+      }
+      case "set_split": {
+        const url = params.url;
+        if (typeof url !== "string" || !/^(https?|file):\/\//i.test(url)) {
+          return { ok: false, error: "invalid url" };
+        }
+        const partner = await findSplitPartner(tab);
+        if (!partner) return { ok: false, error: "NO_SPLIT_TAB" };
+        await browser.tabs.update(partner.id, { url });
+        return { ok: true };
+      }
+      case "get_timers": {
+        const all = await handleGetTimerTabs({ include_log: !!params.include_log });
+        // Only expose the timer this caller created; don't enumerate all timer tabs.
+        const ownedId = timerCallerMap.get(caller);
+        const owned = ownedId != null ? all.filter(t => t.tabId === ownedId) : [];
+        // Strip tabId before returning to the page.
+        return { ok: true, timers: owned.map(({ tabId: _, ...rest }) => rest) };
+      }
+      case "timer_action": {
+        if (typeof params.action !== "string") return { ok: false, error: "action required" };
+        const tabId = Number.isInteger(params.tabId) ? params.tabId : null;
+        const value = params.value != null ? String(params.value) : undefined;
+        const res = await handleTimerAction({ action: params.action, value, tabId, callerTabId: caller });
+        const { tabId: _, ...safeRes } = res;
+        return safeRes;
+      }
+      case "create_timer": {
+        const direction = params.direction === "down" ? "down" : "up";
+        const value = params.value != null ? String(params.value) : undefined;
+        const res = await handleCreateTimerTab({ value, direction, callerTabId: caller });
+        const { tabId: _, ...safeRes } = res;
+        return safeRes;
+      }
+      case "open_side_panel": {
+        const path = params.path && typeof params.path === "string" ? params.path : undefined;
+        if (IS_FIREFOX) {
+          browser.sidebarAction.open().catch(e => console.error("sidebarAction.open error:", e));
+        } else {
+          browser.sidePanel.open({ windowId: tab.windowId }).catch(e => console.error("sidePanel.open error:", e));
+        }
+        if (port) {
+          port.postMessage({ type: "startOpencode", tabId: tab.id, windowId: tab.windowId, path });
+        }
+        return { ok: true };
+      }
+      default:
+        return { ok: false, error: "UNSUPPORTED_ENDPOINT" };
+    }
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 function handleCommand(msg) {
